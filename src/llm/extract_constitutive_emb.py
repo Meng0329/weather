@@ -191,7 +191,7 @@ class APIEncoder:
 
     name = "api:Qwen3-Embedding-0.6B"
 
-    def __init__(self, dim: int = 1024, batch: int = 32, workers: int = 32,
+    def __init__(self, dim: int = 1024, batch: int = 128, workers: int = 96,
                  base: str = API_BASE, key: str = API_KEY, model: str = API_EMBED_MODEL):
         self.dim = dim                 # 目标（MRL 截断后）维度
         self.raw_dim = dim             # 服务原生维度，fit 时探测
@@ -217,11 +217,15 @@ class APIEncoder:
                 self.cache = {}
 
     def save_cache(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.cache_path.with_suffix(".tmp")
-        with tmp.open("wb") as fh:
-            pickle.dump(self.cache, fh, protocol=4)
-        tmp.replace(self.cache_path)
+        """原子写盘；并发/多进程场景下失败也不致命（缓存可重建）。"""
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.cache_path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("wb") as fh:
+                pickle.dump(self.cache, fh, protocol=4)
+            os.replace(tmp, self.cache_path)
+        except Exception as e:                           # noqa: BLE001
+            log.warning("嵌入缓存写盘失败（忽略）：%s", e)
 
     # -- 单请求 -------------------------------------------------------
     MAX_CHARS = 1200          # 单条文本截断长度（超出模型上下文的记录会 500）
@@ -322,11 +326,15 @@ class APIReranker:
                 self.cache = {}
 
     def save_cache(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.cache_path.with_suffix(".tmp")
-        with tmp.open("wb") as fh:
-            pickle.dump(self.cache, fh, protocol=4)
-        tmp.replace(self.cache_path)
+        """原子写盘；并发/多进程场景下失败也不致命（缓存可重建）。"""
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.cache_path.with_suffix(f".{os.getpid()}.tmp")
+            with tmp.open("wb") as fh:
+                pickle.dump(self.cache, fh, protocol=4)
+            os.replace(tmp, self.cache_path)
+        except Exception as e:                           # noqa: BLE001
+            log.warning("嵌入缓存写盘失败（忽略）：%s", e)
 
     def score(self, query: str, docs: list[str]) -> np.ndarray:
         import urllib.request
@@ -500,6 +508,10 @@ def build_rag_prior(
     norms = np.linalg.norm(Cemb, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     Cemb = Cemb / norms
+
+    # 关键：先把**全部**查询文本一次性嵌入。若逐批嵌入，每批只有 3~4 个请求
+    # 在飞，服务端延迟被放大十倍；整表一次性提交才能把并发打满（后续均为命中缓存）。
+    encoder.transform(list(query_texts))
 
     out = np.zeros((len(query_texts), encoder.dim), dtype=np.float32)
     for i in range(0, len(query_texts), batch):

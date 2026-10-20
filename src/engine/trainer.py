@@ -157,9 +157,14 @@ def compute_metrics(topo_prob: torch.Tensor, topo_true: torch.Tensor,
         cp = cont.reshape(-1, cont.shape[-1]).detach().cpu().numpy()[cm]
         ct = cont_true.reshape(-1, cont_true.shape[-1]).detach().cpu().numpy()[cm]
         out["log_mae"] = float(np.abs(cp - ct).mean())
+        # R² 只在**有方差**的目标列上统计：某列在批内几乎为常数时 ss_tot≈0，
+        # 直接相除会给出 -1e9 级别、毫无信息量的伪结果。
         ss_res = ((cp - ct) ** 2).sum(0)
-        ss_tot = ((ct - ct.mean(0)) ** 2).sum(0) + 1e-9
-        out["r2"] = float((1 - ss_res / ss_tot).mean())
+        ss_tot = ((ct - ct.mean(0)) ** 2).sum(0)
+        valid = ss_tot > 1e-3 * max(len(ct), 1)
+        out["r2"] = float(np.clip(
+            (1 - ss_res[valid] / ss_tot[valid]).mean(), -10.0, 1.0)) if valid.any() else float("nan")
+        out["r2_n_valid"] = int(valid.sum())
     else:
         out["log_mae"] = float("nan")
         out["r2"] = float("nan")
@@ -286,9 +291,19 @@ def train(model_builder, tcfg: TrainConfig, loss_cfg: LossConfig | None = None,
                                 batch["level"], batch["level_mask"], out["cont"],
                                 batch["cont"], batch["cont_mask"])
             m.update(parts)
-            agg = m if agg is None else {k: agg[k] + m[k] for k in m}
+            if agg is None:
+                agg = {k: [] for k in m}
+            for k, v in m.items():
+                agg[k].append(v)
             n_batches += 1
-        return {k: v / max(n_batches, 1) for k, v in (agg or {}).items()}
+        # 逐批指标取**有限值**的均值：损失类指标在部分批上无正样本属正常，
+        # 直接平均会把整轮结果污染成 NaN。
+        out = {}
+        for k, vals in (agg or {}).items():
+            arr = np.asarray(vals, dtype=np.float64)
+            arr = arr[np.isfinite(arr)]
+            out[k] = float(arr.mean()) if arr.size else float("nan")
+        return out
 
     t0 = time.time()
     for ep in range(1, tcfg.epochs + 1):

@@ -273,6 +273,11 @@ class LandauPhaseTransitionReadout(nn.Module):
                                         nn.Linear(hidden, NUM_LEVELS))
         self.cont_head = nn.Sequential(nn.Linear(d_model + 1, hidden), nn.GELU(),
                                        nn.Linear(hidden, NUM_CONT))
+        # 连续损失在 log10(1+y) 空间取值 ~0.5~4；ReLU 读出若从 0 起步会长时间
+        # 学不到尺度（R² 起初极端为负）。把末层偏置初始化到该先验均值附近。
+        nn.init.constant_(self.cont_head[-1].bias, 1.5)
+        with torch.no_grad():
+            self.cont_head[-1].weight.mul_(0.1)
         self.drop = nn.Dropout(dropout)
 
     def phase_gate(self, U: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
