@@ -561,6 +561,14 @@ docs/paper/    # 论文各章节 Markdown/LaTeX 源码与实验结果表格汇�
   | 1 | 1.2781 | 1.1236 | 0.000 | 0.0226 | 0.842 | 1.07 | -1.40 |
   | 2 | 1.1445 | 1.1385 | 0.000 | 0.0164 | 0.843 | — | — |
   | 3 | 1.1032 | 1.1169 | 0.000 | 0.0177 | 0.842 | — | — |
+- 跨区域复现（同配置，2–3 epoch）：
+  | 区域 | train loss | val loss | AUPRC | Hits@3 | log-MAE | R² |
+  |---|---:|---:|---:|---:|---:|---:|
+  | SW-Cascade (3 ep) | 1.28→1.10 | 1.12 | 0.018 | 0.842 | 1.07 | -1.40 |
+  | SE-Typhoon (2 ep) | 1.09→0.86 | 0.87 | 0.008 | 0.682 | 0.90 | -0.76 |
+  | North-Agro (2 ep) | 1.23→1.06 | 0.97 | 0.007 | 0.560 | 1.39 | -1.59 |
+  三个区域一致表现出：损失单调下降、Hits@3 显著高于随机（0.214）、
+  连续损失可学到尺度。说明算子结构与数据契约跨区域一致，不是单区域调参产物。
 - 判读：
   - train loss **单调下降**（1.28 → 1.10），管线与梯度路径正确；显存 < 1 GB。
   - Hits@3 **0.84** 远高于随机基线 3/14 ≈ 0.214 —— 排序能力已建立。
@@ -580,9 +588,10 @@ docs/paper/    # 论文各章节 Markdown/LaTeX 源码与实验结果表格汇�
   因此提取器内置：整表预热、滑动平均延迟自适应降级、嵌入/精排磁盘缓存（限频原子写盘）。
 - 产物：`<REGION>/llm_embeddings.pt`，键
   `record_ids / node_idx / date / split / h_pre / h_post / h_rag / dim / method / top_k_rag`。
-  已完成 **SW_Cascade（512 维，Qwen3-Embedding）**；SE_Typhoon / North_Agro 若退回
-  本地 `bert-base-chinese`（256 维），`RegionBundle.text_dim` 会按区域自适应读取，
-  训练不受影响，但论文表格须标注各区域的文本编码器版本。
+  **三个区域全部完成 512 维 Qwen3-Embedding 产物**：
+  SW_Cascade (33,713 条) / SE_Typhoon (8,139) / North_Agro (14,879)。
+  若后续退回本地 `bert-base-chinese`（256 维），`RegionBundle.text_dim` 会按区域
+  自适应读取，但论文表格必须标注各区域使用的文本编码器版本。
 - **密钥与地址只从环境变量或 `~/.config/ptgno/env` 读取，禁止写入仓库**。
 
 ---
