@@ -292,9 +292,9 @@ def train(model_builder, tcfg: TrainConfig, loss_cfg: LossConfig | None = None,
                                 batch["cont"], batch["cont_mask"])
             m.update(parts)
             if agg is None:
-                agg = {k: [] for k in m}
+                agg = {}
             for k, v in m.items():
-                agg[k].append(v)
+                agg.setdefault(k, []).append(v)
             n_batches += 1
         # 逐批指标取**有限值**的均值：损失类指标在部分批上无正样本属正常，
         # 直接平均会把整轮结果污染成 NaN。
