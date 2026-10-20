@@ -203,6 +203,8 @@ class APIEncoder:
         self.base, self.key, self.model = base.rstrip("/"), key, model
         self.cache: dict[str, np.ndarray] = {}
         self.n_calls = 0
+        self._last_save = 0.0
+        self.save_interval = float(os.environ.get("LLM_CACHE_SAVE_SEC", "180"))
         self._lock = threading.Lock()
         # 磁盘缓存：文本 -> 向量，跨进程/跨区域复用，避免重复付费与限流
         self.cache_path = Path(os.environ.get(
@@ -216,8 +218,16 @@ class APIEncoder:
                 log.warning("嵌入缓存损坏，忽略（%s）", e)
                 self.cache = {}
 
-    def save_cache(self) -> None:
-        """原子写盘；并发/多进程场景下失败也不致命（缓存可重建）。"""
+    def save_cache(self, force: bool = False) -> None:
+        """原子写盘；并发/多进程场景下失败也不致命（缓存可重建）。
+
+        缓存可能上百 MB，逐批全量重写会把 IO 打满、反而拖慢提取，
+        因此默认按 `save_interval` 限频，进程退出时再强制写一次。
+        """
+        now = time.time()
+        if not force and now - self._last_save < self.save_interval:
+            return
+        self._last_save = now
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.cache_path.with_suffix(f".{os.getpid()}.tmp")
@@ -313,6 +323,8 @@ class APIReranker:
         self.max_latency = max_latency
         self.enabled = True
         self._lat_window: list[float] = []      # 最近若干次调用的延迟
+        self._last_save = 0.0
+        self.save_interval = float(os.environ.get("LLM_CACHE_SAVE_SEC", "180"))
         self._lock = threading.Lock()
         self.cache_path = Path(os.environ.get(
             "LLM_RERANK_CACHE", "datasets/processed/llm_rerank_cache.pkl"))
@@ -325,8 +337,16 @@ class APIReranker:
             except Exception:                            # noqa: BLE001
                 self.cache = {}
 
-    def save_cache(self) -> None:
-        """原子写盘；并发/多进程场景下失败也不致命（缓存可重建）。"""
+    def save_cache(self, force: bool = False) -> None:
+        """原子写盘；并发/多进程场景下失败也不致命（缓存可重建）。
+
+        缓存可能上百 MB，逐批全量重写会把 IO 打满、反而拖慢提取，
+        因此默认按 `save_interval` 限频，进程退出时再强制写一次。
+        """
+        now = time.time()
+        if not force and now - self._last_save < self.save_interval:
+            return
+        self._last_save = now
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.cache_path.with_suffix(f".{os.getpid()}.tmp")

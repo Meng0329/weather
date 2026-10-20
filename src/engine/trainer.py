@@ -330,7 +330,8 @@ def train(model_builder, tcfg: TrainConfig, loss_cfg: LossConfig | None = None,
                     print(f"[{tcfg.region}] early stop @ ep{ep}", flush=True)
                 break
 
-    result = {"region": tcfg.region, "best": best, "history": history,
+    result = {"region": tcfg.region, "config": asdict(tcfg),
+              "loss_config": asdict(loss_cfg), "best": best, "history": history,
               "seconds": round(time.time() - t0, 1),
               "model_params": int(sum(p.numel() for p in model.parameters())),
               "n_train_days": len(tr), "n_val_days": len(va),
