@@ -88,6 +88,85 @@ def _zscore_rows(x: np.ndarray) -> np.ndarray:
 
 
 # ==========================================================================
+# Phase 1.5 §6.7：洪涝多标签共激活
+# ==========================================================================
+_FLOOD_TYPE_RE = "|".join(C.FLOOD_TYPE_KEYWORDS)
+_FLOOD_TEXT_RE = "|".join(C.FLOOD_TEXT_KEYWORDS)
+
+
+def add_flood_activation(df: pd.DataFrame) -> pd.DataFrame:
+    """为每条记录计算 `label_types`（14 类多标签集合）。
+
+    规则（决议 §6.7）：
+      1. `disaster_type_14` 的主类必然激活；
+      2. 原始 `disaster_type` 命中 洪涝|洪水|内涝|渍涝|山洪|凌汛 -> 额外激活 `洪涝`
+         （含 70,158 条 `暴雨洪涝`，使其同时激活 `暴雨` 与 `洪涝`）；
+      3. `disaster_subtype` 或 `impact_description` 命中文本关键词 -> 额外激活 `洪涝`。
+    """
+    df = df.copy()
+    main = df["disaster_type_14"].to_numpy()
+    raw = df["disaster_type"].fillna("").astype(str)
+    sub = df["disaster_subtype"].fillna("").astype(str)
+    desc = df["impact_description"].fillna("").astype(str)
+
+    flood = (
+        raw.str.contains(_FLOOD_TYPE_RE, regex=True)
+        | sub.str.contains(_FLOOD_TEXT_RE, regex=True)
+        | desc.str.contains(_FLOOD_TEXT_RE, regex=True)
+    ).to_numpy()
+    df["flood_activated"] = flood
+
+    labels: list[list[str]] = []
+    for t, f in zip(main, flood):
+        s = {t} if isinstance(t, str) else set()
+        if f:
+            s.add("洪涝")
+        labels.append(sorted(s, key=lambda x: C.DISASTER_TYPE_TO_IDX[x]))
+    df["label_types"] = labels
+    return df
+
+
+def compute_cascade_stats(rec: pd.DataFrame) -> dict:
+    """统计灾害链级联样本（决议 §6.7）。
+
+    - 暴雨→洪涝：同一区县内，暴雨洪涝事件的持续天数 >= 2 天记 1 个正样本；
+    - 暴雨→洪涝→地质灾害：同一区县内洪涝激活后 [t, t+3] 天内出现地质灾害。
+    """
+    d = rec[rec["cont_loss_mask"] == 1].copy()
+    if not len(d):
+        return {"storm_flood_pairs": 0, "storm_flood_geo_triples": 0}
+
+    d["start_date"] = pd.to_datetime(d["start_date"])
+    has_storm = d["label_types"].apply(lambda ts: "暴雨" in ts)
+    has_flood = d["label_types"].apply(lambda ts: "洪涝" in ts)
+
+    # 暴雨→洪涝：持续 >= 2 天且同时激活暴雨与洪涝
+    pair = d[has_storm & has_flood & (d["duration_days"] >= 2)]
+    n_pairs = int(len(pair))
+
+    # 暴雨→洪涝→地质灾害：按 (cnty_id) 在 ±3 天内找地质灾害
+    geo = d[d["disaster_type_14"] == "地质灾害"][["cnty_id", "start_date"]]
+    flood_ev = d[has_storm & has_flood][["cnty_id", "start_date"]]
+    n_triples = 0
+    if len(geo) and len(flood_ev):
+        geo_by_cnty = {
+            k: v.sort_values().to_numpy()
+            for k, v in geo.groupby("cnty_id")["start_date"]
+        }
+        for cnty, sd in zip(flood_ev["cnty_id"], flood_ev["start_date"]):
+            arr = geo_by_cnty.get(cnty)
+            if arr is None:
+                continue
+            lo, hi = sd, sd + pd.Timedelta(days=3)
+            if ((arr >= lo) & (arr <= hi)).any():
+                n_triples += 1
+    return {
+        "storm_flood_pairs": n_pairs,
+        "storm_flood_geo_triples": int(n_triples),
+    }
+
+
+# ==========================================================================
 # 空间邻接
 # ==========================================================================
 def build_adjacency(
@@ -96,7 +175,13 @@ def build_adjacency(
     tem_avg: np.ndarray,
     dates: pd.DatetimeIndex,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """同地市连通 + 同省/邻省物理 Top-K。返回 (adj, weight, stats)。"""
+    """分层双池（Stratified Dual-Pool）有向平流图。
+
+    池 1（同域）：同地市完全连通 + 同省内相关系数 Top-K_IN_PROV
+    池 2（跨域）：相邻省份（限区域子集内）相关系数 Top-K_CROSS_PROV
+
+    决议 §6.9：跨省边占比目标 20%~30%（Phase 1 双池前仅 3.3%~5.4%）。
+    """
     n = len(stations)
     prov = stations["Province"].to_numpy()
     city_key = pd.factorize(
@@ -153,22 +238,39 @@ def build_adjacency(
             else:
                 np.fill_diagonal(score[np.ix_(ia, ib)], -np.inf)
 
-    # ---- 3. 每节点取 Top-K 正相关出边 ----
-    physical_edges = 0
-    k = C.PHYSICAL_NEIGHBOR_K
+    # ---- 3. 双池取边：同省 Top-K_IN_PROV + 跨省 Top-K_CROSS_PROV ----
+    in_prov_edges = 0
+    cross_prov_edges = 0
     for i in range(n):
         row = score[i]
-        cand = np.nonzero(np.isfinite(row) & (row > 0))[0]
-        if len(cand) == 0:
+        finite = np.isfinite(row)
+        if not finite.any():
             continue
-        order = cand[np.argsort(row[cand])[::-1][:k]]
-        for j in order:
-            if i == j:
+        same_prov_mask = finite & (prov == prov[i])
+        cross_prov_mask = finite & (prov != prov[i])
+
+        for mask, k, is_cross in (
+            (same_prov_mask, C.K_IN_PROV, False),
+            (cross_prov_mask, C.K_CROSS_PROV, True),
+        ):
+            cand = np.nonzero(mask)[0]
+            if len(cand) == 0:
                 continue
-            if not adj[i, j]:
-                physical_edges += 1
-            adj[i, j] = True
-            wgt[i, j] = max(wgt[i, j], float(row[j]))
+            # 只保留正相关（负相关不代表平流输送）
+            cand = cand[row[cand] > 0]
+            if len(cand) == 0:
+                continue
+            top = cand[np.argsort(row[cand])[::-1][:k]]
+            for j in top:
+                if i == j:
+                    continue
+                if not adj[i, j]:
+                    if is_cross:
+                        cross_prov_edges += 1
+                    else:
+                        in_prov_edges += 1
+                adj[i, j] = True
+                wgt[i, j] = max(wgt[i, j], float(row[j]))
 
     np.fill_diagonal(adj, False)
     np.fill_diagonal(wgt, 0.0)
@@ -183,13 +285,17 @@ def build_adjacency(
         "n_nodes": int(n),
         "n_edges": int(adj.sum()),
         "same_city_edges": int(same_city_edges),
-        "physical_edges_added": int(physical_edges),
+        "in_prov_physical_edges": int(in_prov_edges),
+        "cross_prov_physical_edges": int(cross_prov_edges),
+        "physical_edges_added": int(in_prov_edges + cross_prov_edges),
         "mean_out_degree": round(float(out_deg.mean()), 3),
         "median_out_degree": float(np.median(out_deg)),
         "max_out_degree": int(out_deg.max()),
         "isolated_nodes": int((out_deg == 0).sum()),
         "cross_province_edge_ratio": round(cross_prov / max(adj.sum(), 1), 4),
         "train_days_used": int(n_tr),
+        "k_in_prov": C.K_IN_PROV,
+        "k_cross_prov": C.K_CROSS_PROV,
     }
     return adj, wgt, stats
 
@@ -223,11 +329,21 @@ def build_region(
     nodes.insert(0, "node_idx", np.arange(len(nodes), dtype=np.int64))
     nodes.to_parquet(out / "nodes.parquet", index=False)
 
-    # 气象张量切片
-    f_sub = np.asarray(feats[global_ids])       # (N, T, 16)
+    # 气象张量切片（Phase 1.5：落盘 16 维，读取时索引 15 维建模通道）
+    f_sub = np.asarray(feats[global_ids])       # (N, T, 16) 原始落盘维度
     m_sub = np.asarray(mask[global_ids])
-    np.save(out / "meteo_features.npy", f_sub)
-    np.save(out / "meteo_observed_mask.npy", m_sub)
+    # 建模用 15 维契约：剔除 WIN_S_10mi_Avg（2018-2025 全缺）
+    f_model = f_sub[:, :, C.FEATURE_IDX_15]
+    m_model = m_sub[:, :, C.FEATURE_IDX_15]
+    np.save(out / "meteo_features.npy", f_model)
+    np.save(out / "meteo_observed_mask.npy", m_model)
+    _dump_json(out / "feature_contract.json", {
+        "feature_names": C.FEATURE_NAMES_15,
+        "n_features": C.N_FEATURES_MODEL,
+        "source_raw_names": C.FEATURE_NAMES,
+        "dropped": ["WIN_S_10mi_Avg"],
+        "advection_physical_cols": C.ADV_PHYSICAL_COLS,
+    })
 
     # 邻接
     if skip_adjacency and (out / "adj_mask.npy").exists():
@@ -235,8 +351,8 @@ def build_region(
         wgt = np.load(out / "adj_weight.npy")
         adj_stats = {"reused": True}
     else:
-        delta = f_sub[:, :, C.FEATURE_NAMES.index("delta_prs_24h")]
-        tem = f_sub[:, :, C.FEATURE_NAMES.index("TEM_Avg")]
+        delta = f_model[:, :, C.FEATURE_NAMES_15.index("delta_prs_24h")]
+        tem = f_model[:, :, C.FEATURE_NAMES_15.index("TEM_Avg")]
         adj, wgt, adj_stats = build_adjacency(nodes, delta, tem, dates)
         np.save(out / "adj_mask.npy", adj)
         np.save(out / "adj_weight.npy", wgt)
@@ -247,13 +363,39 @@ def build_region(
         )
 
     # ---- 灾情样本 ----
+    # Phase 1.5：保留 L4_text_multi 记录（多候选区县），展开为 record-node 链接
     rec = disaster[disaster["province"].isin(provinces)].copy()
-    rec = rec[rec["cnty_id"] >= 0].copy()
-    rec["node_idx"] = rec["cnty_id"].map(local_idx)
     n_before = len(rec)
+
+    # 洪涝共激活（决议 §6.7）：多标签而非互斥单分类
+    rec = add_flood_activation(rec)
+
+    # 展开候选区县
+    node_lists = []
+    for cid, cands in zip(rec["cnty_id"].to_numpy(), rec["cnty_candidates"].to_numpy()):
+        if cid >= 0:
+            node_lists.append([int(cid)])
+        elif isinstance(cands, str) and cands.strip():
+            node_lists.append([int(x) for x in cands.split(",") if x.strip()])
+        else:
+            node_lists.append([])
+    rec["_node_list"] = node_lists
+    rec = rec[rec["_node_list"].map(len) > 0].copy()
+    rec = rec.explode("_node_list")
+    # 注意：不能 rename 成 "cnty_id"（原列已存在，会产生重复列导致 .map 失效）
+    rec["node_cnty_id"] = rec["_node_list"].astype(np.int64)
+    rec = rec.drop(columns=["_node_list"])
+
+    # L4_text_multi 的连续损失不可归属到单一区县 -> 掩码置 0
+    rec["cont_loss_mask"] = np.where(
+        rec["align_level"].eq("L4_text_multi"), 0, rec["cont_loss_mask"]
+    ).astype(np.int8)
+
+    rec["node_idx"] = rec["node_cnty_id"].map(local_idx)
+    n_unmapped = int(rec["node_idx"].isna().sum())
     rec = rec[rec["node_idx"].notna()].copy()
     rec["node_idx"] = rec["node_idx"].astype(np.int64)
-    n_dropped = n_before - len(rec)
+    n_dropped = n_before - rec["record_id"].nunique()
 
     rec["split"] = _split_tag(rec["start_time"].dt.year)
     rec["type_idx"] = rec["disaster_type_14"].map(C.DISASTER_TYPE_TO_IDX)
@@ -261,29 +403,47 @@ def build_region(
     rec["end_date"] = rec["end_time"].dt.normalize()
     rec = rec[rec["split"] != "out_of_range"].copy()
 
+    # 多标签编码：每条记录激活的 14 类集合
+    rec["type_multihot"] = rec["label_types"].apply(
+        lambda ts: ",".join(str(C.DISASTER_TYPE_TO_IDX[t]) for t in ts)
+    )
+    rec["n_active_types"] = rec["label_types"].apply(len)
+
     keep_cols = [
-        "record_id", "node_idx", "cnty_id", "province", "city", "county",
-        "disaster_type_14", "type_idx", "loss_level_id", "start_time", "end_time",
+        "record_id", "node_idx", "cnty_id", "node_cnty_id", "province", "city", "county",
+        "disaster_type_14", "type_idx", "type_multihot", "n_active_types",
+        "label_types", "flood_activated",
+        "loss_level_id", "start_time", "end_time",
         "start_date", "end_date", "report_status", "report_time", "event_chain_id",
-        "split", "align_level",
+        "split", "align_level", "cont_loss_mask", "duration_days",
     ] + [c for c in LOSS_TARGET_COLS if c in rec.columns]
     records = rec[[c for c in keep_cols if c in rec.columns]].copy()
     records.to_parquet(out / "records.parquet", index=False)
 
-    # ---- 事件级样本：同一节点同一天聚合 ----
+    # ---- 事件级样本：同一节点同一天聚合（多标签）----
     if len(records):
-        agg = {"economic_loss": "sum"}
-        for c in LOSS_TARGET_COLS:
-            if c in records.columns and c != "economic_loss":
-                agg[c] = "sum"
-        agg["type_idx"] = lambda s: sorted(set(int(x) for x in s if pd.notna(x)))
-        agg["record_id"] = "size"
-
-        events = (
-            records.groupby(["node_idx", "start_date"], as_index=False)
-            .agg(agg)
-            .rename(columns={"record_id": "n_records", "start_date": "date"})
+        # 连续损失只由可归属到单一区县的记录贡献（多候选记录掩码为 0）
+        loss_cols = [c for c in LOSS_TARGET_COLS if c in records.columns]
+        masked = records[records["cont_loss_mask"] == 1]
+        loss_agg = (
+            masked.groupby(["node_idx", "start_date"])[loss_cols].sum()
+            if len(masked) else None
         )
+
+        grp = records.groupby(["node_idx", "start_date"], sort=False)
+        events = grp.size().reset_index(name="n_records")
+        # 多标签类型的并集
+        type_union = grp["type_multihot"].apply(
+            lambda s: sorted({int(x) for v in s for x in str(v).split(",") if x != ""})
+        ).reset_index(name="type_idx")
+        events = events.merge(type_union, on=["node_idx", "start_date"], how="left")
+        events = events.rename(columns={"start_date": "date"})
+        if loss_agg is not None and len(loss_agg):
+            events = events.merge(
+                loss_agg.reset_index().rename(columns={"start_date": "date"}),
+                on=["node_idx", "date"], how="left",
+            )
+            events[loss_cols] = events[loss_cols].fillna(0.0)
         events["split"] = _split_tag(events["date"].dt.year)
         events["n_types"] = events["type_idx"].apply(len)
         events["primary_type_idx"] = events["type_idx"].apply(
@@ -297,20 +457,22 @@ def build_region(
         events = pd.DataFrame()
         events.to_parquet(out / "events.parquet", index=False)
 
-    # ---- 生命期展开标签矩阵 (N, T, 14) ----
+    # ---- 生命期展开标签矩阵 (N, T, 14)：多标签激活 ----
     labels = np.zeros((len(nodes), len(dates), C.NUM_DISASTER_TYPES), dtype=np.uint8)
     date_pos = {d.normalize(): i for i, d in enumerate(dates)}
-    for node_i, sd, ed, ti in zip(
-        records["node_idx"], records["start_date"], records["end_date"], records["type_idx"]
+    for node_i, sd, ed, tis in zip(
+        records["node_idx"], records["start_date"], records["end_date"],
+        records["type_multihot"],
     ):
-        if pd.isna(ti):
+        if not isinstance(tis, str) or not tis:
             continue
         a = date_pos.get(sd)
         b = date_pos.get(ed, a)
         if a is None:
             continue
         b = a if b is None else max(b, a)
-        labels[int(node_i), a:b + 1, int(ti)] = 1
+        for t in tis.split(","):
+            labels[int(node_i), a:b + 1, int(t)] = 1
     np.save(out / "daily_labels.npy", labels)
 
     # ---- 统计 ----
@@ -318,16 +480,29 @@ def build_region(
     for sp in ["train", "val", "test"]:
         r = records[records["split"] == sp]
         e = events[events["split"] == sp] if len(events) else events
+        types = r["label_types"].explode() if len(r) else pd.Series(dtype=object)
         split_stats[sp] = {
-            "n_records": int(len(r)),
+            "n_records": int(r["record_id"].nunique()) if len(r) else 0,
+            "n_label_rows": int(len(r)),
             "n_events": int(len(e)),
             "n_nodes_with_events": int(r["node_idx"].nunique()),
-            "class_counts": r["disaster_type_14"].value_counts().to_dict(),
-            "label_positive_cells": int(labels[:, :, :].sum()) if sp == "train" else None,
+            "class_counts": types.value_counts().to_dict(),
+            "n_multihot_records": int((r["n_active_types"] > 1).sum()) if len(r) else 0,
         }
-    # 去掉占位
-    for sp in split_stats:
-        split_stats[sp].pop("label_positive_cells", None)
+
+    # 洪涝激活与级联统计（Phase 1.5）
+    all_types = records["label_types"].explode() if len(records) else pd.Series(dtype=object)
+    flood_stats = {
+        "flood_activations_total": int((all_types == "洪涝").sum()),
+        "flood_activations_by_split": {
+            sp: int((records.loc[records["split"] == sp, "label_types"]
+                     .explode() == "洪涝").sum())
+            for sp in ["train", "val", "test"]
+        },
+        "records_with_flood_flag": int(records["flood_activated"].sum())
+        if "flood_activated" in records.columns else 0,
+    }
+    cascade_stats = compute_cascade_stats(records)
 
     stats = {
         "region": name,
@@ -338,9 +513,17 @@ def build_region(
         "n_days": int(len(dates)),
         "date_start": str(dates[0].date()),
         "date_end": str(dates[-1].date()),
-        "n_feature_channels": int(f_sub.shape[2]),
-        "disaster_records_dropped_no_node": int(n_dropped),
+        "n_feature_channels": int(f_model.shape[2]),
+        "feature_names": C.FEATURE_NAMES_15,
+        "n_records_unique": int(records["record_id"].nunique()) if len(records) else 0,
+        "n_record_node_links": int(len(records)),
+        "n_records_dropped_no_node": int(n_dropped),
+        "n_links_unmapped_to_local": int(n_unmapped),
+        "alignment_levels": records["align_level"].value_counts().to_dict()
+        if len(records) else {},
         "adjacency": adj_stats,
+        "flood": flood_stats,
+        "cascade": cascade_stats,
         "splits": split_stats,
         "positive_cells_total": int(labels.sum()),
     }
@@ -492,7 +675,7 @@ def write_data_stats(
 
     # --- 三大基准 ---
     L.append("## 4. 三大区域基准\n")
-    L.append("| 数据集 | 节点数 | 边数 | 平均出度 | 跨省边占比 | 训练记录 | 验证记录 | 测试记录 |")
+    L.append("| 数据集 | 节点数 | 边数 | 平均出度 | 跨省边占比 | 训练事件 | 验证事件 | 测试事件 |")
     L.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     for name, st in region_stats.items():
         adj = st.get("adjacency", {})
@@ -501,9 +684,52 @@ def write_data_stats(
             f"| **{st['label']}** | {st['n_nodes']} | {adj.get('n_edges', 'NA')} | "
             f"{adj.get('mean_out_degree', 'NA')} | "
             f"{adj.get('cross_province_edge_ratio', 0) * 100:.1f}% | "
-            f"{sp.get('train', {}).get('n_records', 0):,} | "
-            f"{sp.get('val', {}).get('n_records', 0):,} | "
-            f"{sp.get('test', {}).get('n_records', 0):,} |"
+            f"{sp.get('train', {}).get('n_events', 0):,} | "
+            f"{sp.get('val', {}).get('n_events', 0):,} | "
+            f"{sp.get('test', {}).get('n_events', 0):,} |"
+        )
+    L.append("")
+
+    # --- Phase 1.5 洪涝与对齐 ---
+    L.append("## 5. Phase 1.5 修正：洪涝多标签、文本下探、双池邻接\n")
+    tr = cleaning.get("disaster", {}).get("text_recovery")
+    if tr:
+        L.append("### 5.1 市级记录文本二次下探（全局）\n")
+        L.append(f"- 下探前未对齐：**{tr['n_miss_before']:,}** 条")
+        L.append(f"- 唯一命中（完整纳入该区县监督）：**{tr['unique']:,}** 条")
+        L.append(f"- 多候选（仅激活拓扑标签，`cont_loss_mask=0`）：**{tr['multi']:,}** 条")
+        L.append(f"- 仍无法定位（剔除）：**{tr['unresolved']:,}** 条")
+        L.append(f"- 下探后已对齐：**{tr['n_aligned_after']:,}** 条\n")
+
+    L.append("### 5.2 洪涝多标签激活与级联（分区域）\n")
+    L.append("| 数据集 | 洪涝激活总次数 | 训练 | 验证 | 测试 | 暴雨→洪涝对 | 暴雨→洪涝→地质灾害三元链 |")
+    L.append("|---|---:|---:|---:|---:|---:|---:|")
+    tot_flood = 0
+    for name, st in region_stats.items():
+        fl = st.get("flood", {})
+        cs = st.get("cascade", {})
+        tot_flood += fl.get("flood_activations_total", 0)
+        fs = fl.get("flood_activations_by_split", {})
+        L.append(
+            f"| **{st['label']}** | {fl.get('flood_activations_total', 0):,} | "
+            f"{fs.get('train', 0):,} | {fs.get('val', 0):,} | {fs.get('test', 0):,} | "
+            f"{cs.get('storm_flood_pairs', 0):,} | {cs.get('storm_flood_geo_triples', 0):,} |"
+        )
+    L.append(f"\n> 三区域洪涝激活合计：**{tot_flood:,}** 次"
+             f"（Phase 1 单标签口径下仅 36 条）。\n")
+
+    L.append("### 5.3 双池空间平流图\n")
+    L.append("| 数据集 | 边数 | 同地市边 | 同省物理边 | 跨省物理边 | 跨省边占比 | 孤立节点 |")
+    L.append("|---|---:|---:|---:|---:|---:|---:|")
+    for name, st in region_stats.items():
+        a = st.get("adjacency", {})
+        L.append(
+            f"| **{st['label']}** | {a.get('n_edges', 'NA')} | "
+            f"{a.get('same_city_edges', 'NA'):,} | "
+            f"{a.get('in_prov_physical_edges', 'NA'):,} | "
+            f"{a.get('cross_prov_physical_edges', 'NA'):,} | "
+            f"{a.get('cross_province_edge_ratio', 0) * 100:.1f}% | "
+            f"{a.get('isolated_nodes', 'NA')} |"
         )
     L.append("")
 
@@ -511,20 +737,25 @@ def write_data_stats(
         L.append(f"### {st['label']}\n")
         L.append(f"- 覆盖省份：{'、'.join(st['provinces'])}")
         L.append(f"- 节点 {st['n_nodes']}，时间 {st['date_start']} ~ {st['date_end']}")
+        L.append(f"- 特征通道 {st['n_feature_channels']} 维（剔除 `WIN_S_10mi_Avg`）")
+        L.append(f"- 记录 {st['n_records_unique']:,} 条 -> record-node 链接 "
+                 f"{st['n_record_node_links']:,} 行（多候选记录展开）")
         a = st.get("adjacency", {})
         L.append(f"- 边 {a.get('n_edges', 'NA')}，同地市边 {a.get('same_city_edges', 'NA')}，"
-                 f"物理近邻新增 {a.get('physical_edges_added', 'NA')}，"
+                 f"同省物理 {a.get('in_prov_physical_edges', 'NA')}，"
+                 f"跨省物理 {a.get('cross_prov_physical_edges', 'NA')}，"
                  f"孤立节点 {a.get('isolated_nodes', 'NA')}")
-        L.append(f"- 无法对齐而丢弃的灾情记录：{st.get('disaster_records_dropped_no_node', 0):,}")
+        L.append(f"- 无法对齐而丢弃的灾情记录：{st.get('n_records_dropped_no_node', 0):,}")
         L.append("")
-        L.append("| 划分 | 年份 | 记录数 | 事件数 | 有事件节点数 |")
-        L.append("|---|---|---:|---:|---:|")
+        L.append("| 划分 | 年份 | 记录数 | 事件数 | 有事件节点数 | 多标签记录数 |")
+        L.append("|---|---|---:|---:|---:|---:|")
         for sp, (y0, y1) in C.SPLITS.items():
             s = st["splits"].get(sp, {})
             L.append(f"| {sp} | {y0}–{y1} | {s.get('n_records', 0):,} | "
-                     f"{s.get('n_events', 0):,} | {s.get('n_nodes_with_events', 0):,} |")
+                     f"{s.get('n_events', 0):,} | {s.get('n_nodes_with_events', 0):,} | "
+                     f"{s.get('n_multihot_records', 0):,} |")
         L.append("")
-        L.append("**类型分布**\n")
+        L.append("**多标签类型分布（激活次数）**\n")
         L.append("| 类型 | 全量 |")
         L.append("|---|---:|")
         allc: dict[str, int] = {}
@@ -536,7 +767,7 @@ def write_data_stats(
         L.append("")
 
     # --- Task 3 ---
-    L.append("## 5. Task 3 金标准同化子集\n")
+    L.append("## 6. Task 3 金标准同化子集\n")
     L.append(f"- 含报告状态的事件链：{assimil_stats.get('n_chains_with_report_status', 0):,}")
     L.append(f"- 多阶段链（≥2 种报告状态）：**{assimil_stats.get('n_multistage_chains', 0):,}**")
     L.append(f"- 含完整 初报+续报+终报 的链：**{assimil_stats.get('n_chains_all_3_stages', 0):,}**")

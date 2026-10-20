@@ -33,7 +33,11 @@ import numpy as np
 import pandas as pd
 
 from src.data import common as C
-from src.data.entity_align import StationIndex, alignment_report
+from src.data.entity_align import (
+    StationIndex,
+    alignment_report,
+    apply_text_recovery,
+)
 
 log = logging.getLogger("clean_and_align")
 
@@ -269,6 +273,7 @@ def clean_disaster(
 
     # 区县对齐必须先于事件链（链的空间键用 cnty_id）
     align_stats = None
+    recovery_stats = None
     if station_index is not None:
         sidx = StationIndex(station_index)
         ids, levels, level_series = sidx.align_series(df)
@@ -281,6 +286,19 @@ def clean_disaster(
         )
         for k, v in align_stats["by_level"].items():
             log.info("  %-30s %d", k, v)
+
+        # Phase 1.5：市级记录的文本二次下探
+        df, recovery_stats = apply_text_recovery(df, station_index)
+        log.info(
+            "文本下探：唯一命中 %d / 多候选 %d / 仍未解决 %d",
+            recovery_stats["unique"], recovery_stats["multi"], recovery_stats["unresolved"],
+        )
+        after = alignment_report(df["align_level"])
+        log.info(
+            "对齐后命中 %d/%d = %.2f%%",
+            after["hits"], after["total"], after["hit_rate"] * 100,
+        )
+        align_stats = after
         miss = df[df["cnty_id"] < 0]
         if len(miss):
             align_stats["miss_samples"] = (
@@ -290,6 +308,8 @@ def clean_disaster(
     else:
         df["cnty_id"] = np.int64(-1)
         df["align_level"] = "no_station_index"
+        df["cnty_candidates"] = ""
+        df["cont_loss_mask"] = np.int8(0)
 
     df, chain_stats = build_event_chains(df)
 
@@ -302,6 +322,7 @@ def clean_disaster(
         "end_time": end_stats,
         "event_chains": chain_stats,
         "alignment": align_stats,
+        "text_recovery": recovery_stats,
         "report_status": {
             "counts": {
                 ("<空值>" if pd.isna(k) else str(k)): int(v)

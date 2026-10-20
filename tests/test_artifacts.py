@@ -220,7 +220,7 @@ def test_region_tensor_shapes(region, dates):
     nodes = pd.read_parquet(_require(d / "nodes.parquet"))
     feats = np.load(_require(d / "meteo_features.npy"), mmap_mode="r")
     labels = np.load(_require(d / "daily_labels.npy"), mmap_mode="r")
-    assert feats.shape == (len(nodes), len(dates), C.N_FEATURES)
+    assert feats.shape == (len(nodes), len(dates), C.N_FEATURES_MODEL)
     assert labels.shape == (len(nodes), len(dates), C.NUM_DISASTER_TYPES)
     assert labels.dtype == np.uint8
 

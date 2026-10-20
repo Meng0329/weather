@@ -183,3 +183,123 @@ def alignment_report(levels: pd.Series) -> dict:
         "hit_rate": round(hits / total, 6) if total else 0.0,
         "by_level": {str(k): int(v) for k, v in sorted(counts.items())},
     }
+
+
+# --------------------------------------------------------------------------
+# 市级记录文本二次下探（Phase 1.5 决议 §6.8）
+# --------------------------------------------------------------------------
+_TEXT_SEARCH_COLS = ("report_unit", "impact_description")
+# 词干匹配的最小长度：过短的词干（如"城"）会大量误命中
+_MIN_STEM_FOR_TEXT = 3
+
+
+def build_city_node_map(stations: pd.DataFrame) -> dict[tuple[str, str], list[tuple[int, str, str]]]:
+    """(省名归一, 地市裸名) -> [(cnty_id, 区县名, 词干), ...]。"""
+    out: dict[tuple[str, str], list[tuple[int, str, str]]] = defaultdict(list)
+    for cid, p, c, t in zip(
+        stations["cnty_id"], stations["Province"], stations["City"], stations["Cnty"]
+    ):
+        pn = norm_province(p)
+        for city_key in {str(c), county_stem(str(c))}:
+            out[(pn, city_key)].append((int(cid), str(t), county_stem(str(t))))
+    # 去重
+    for k, v in out.items():
+        out[k] = sorted(set(v))
+    return out
+
+
+def recover_county_from_text(
+    province: str,
+    city: str,
+    report_unit: str,
+    impact_description: str,
+    city_map: dict,
+) -> list[int]:
+    """在 report_unit / impact_description 中检索该地市下辖的区县名。
+
+    返回候选 cnty_id 列表（去重、保持稳定顺序）。
+    匹配规则：完整区县名命中，或长度 >= 3 的词干命中。
+    """
+    _, city_bare, _ = split_county_string(province, city, "")
+    pn = norm_province(province)
+    candidates = city_map.get((pn, str(city_bare)), [])
+    if not candidates:
+        candidates = city_map.get((pn, county_stem(str(city_bare))), [])
+    if not candidates:
+        return []
+
+    texts = [str(report_unit or ""), str(impact_description or "")]
+    hits: list[int] = []
+    for cid, cnty, stem in candidates:
+        for txt in texts:
+            if not txt:
+                continue
+            if cnty in txt or (len(stem) >= _MIN_STEM_FOR_TEXT and stem in txt):
+                hits.append(cid)
+                break
+    # 稳定去重
+    seen, out = set(), []
+    for c in hits:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def apply_text_recovery(
+    df: pd.DataFrame, stations: pd.DataFrame
+) -> tuple[pd.DataFrame, dict]:
+    """对未对齐记录做文本二次下探。
+
+    写回三类结果：
+      - 唯一命中：cnty_id = 该节点，align_level = "L4_text_unique"，cont_loss_mask = 1
+      - 多命中  ：cnty_id = -1，cnty_candidates 记录候选，align_level = "L4_text_multi"
+                  （仅激活拓扑标签，连续损失掩码为 0）
+      - 仍无命中：align_level = "miss"
+    """
+    df = df.copy()
+    if "cnty_candidates" not in df.columns:
+        df["cnty_candidates"] = ""
+    # 关键：上游过滤会留下带空洞的索引，必须重置，否则位置索引与标签不一致
+    df = df.reset_index(drop=True)
+    city_map = build_city_node_map(stations)
+
+    miss_mask = df["cnty_id"] < 0
+    stats = {"n_miss_before": int(miss_mask.sum()), "unique": 0, "multi": 0, "unresolved": 0}
+
+    idxs = np.nonzero(miss_mask.to_numpy())[0]
+    prov = df["province"].to_numpy()
+    city = df["city"].to_numpy()
+    unit = df["report_unit"].to_numpy()
+    desc = df["impact_description"].to_numpy()
+
+    # 用数组累积结果，最后整体写回，避免 .at / .iat 的逐元素开销与索引陷阱
+    cand_str = df["cnty_candidates"].to_numpy().astype(object)
+    new_id = df["cnty_id"].to_numpy().copy()
+    new_level = df["align_level"].to_numpy().astype(object)
+
+    for i in idxs:
+        cands = recover_county_from_text(prov[i], city[i], unit[i], desc[i], city_map)
+        if not cands:
+            stats["unresolved"] += 1
+            continue
+        cand_str[i] = ",".join(str(c) for c in cands)
+        if len(cands) == 1:
+            new_id[i] = int(cands[0])
+            new_level[i] = "L4_text_unique"
+            stats["unique"] += 1
+        else:
+            new_level[i] = "L4_text_multi"
+            stats["multi"] += 1
+
+    df["cnty_candidates"] = cand_str
+    df["cnty_id"] = new_id
+    df["align_level"] = new_level
+    df["cont_loss_mask"] = (df["cnty_id"] >= 0).astype(np.int8)
+    # 唯一命中但无候选列（L1-L3 命中）也补上自身
+    base = df["cnty_candidates"] == ""
+    df.loc[base & (df["cnty_id"] >= 0), "cnty_candidates"] = (
+        df.loc[base & (df["cnty_id"] >= 0), "cnty_id"].astype(str)
+    )
+    stats["n_aligned_after"] = int((df["cnty_id"] >= 0).sum())
+    return df, stats

@@ -29,8 +29,13 @@ def test_feature_order_matches_documented_contract():
 
 
 def test_dropped_meteo_cols_are_not_features():
-    for col in C.DROPPED_METEO_COLS:
+    # Lit/Thund/Tord 从未进入特征契约；WIN_S_10mi_Avg 只保留在 16 维原始落盘契约中，
+    # 建模用的 15 维契约必须已剔除它（Phase 1.5 §6.6）
+    for col in ("Lit", "Thund", "Tord"):
         assert col not in C.FEATURE_NAMES
+        assert col not in C.FEATURE_NAMES_15
+    assert "WIN_S_10mi_Avg" in C.FEATURE_NAMES
+    assert "WIN_S_10mi_Avg" not in C.FEATURE_NAMES_15
 
 
 def test_privacy_cols_not_in_disaster_usecols():
@@ -323,3 +328,84 @@ def test_interp_rows_handles_all_nan_row():
     assert np.isnan(filled[0]).all()
     assert not observed[0].any()
     assert observed[1].all()
+
+
+# --------------------------------------------------------------------------
+# Phase 1.5 契约
+# --------------------------------------------------------------------------
+def test_model_feature_contract_is_15_dims():
+    assert len(C.FEATURE_NAMES_15) == 15
+    assert C.N_FEATURES_MODEL == 15
+    assert "WIN_S_10mi_Avg" not in C.FEATURE_NAMES_15
+    assert len(C.FEATURE_IDX_15) == 15
+    # 索引必须指向原始 16 维张量中的正确位置
+    for name, idx in zip(C.FEATURE_NAMES_15, C.FEATURE_IDX_15):
+        assert C.FEATURE_NAMES[idx] == name
+
+
+def test_adv_physical_cols_are_all_period_available():
+    assert C.ADV_PHYSICAL_COLS == ["PRS_Avg", "WIN_S_Max", "WIN_S_2mi_Avg"]
+    for c in C.ADV_PHYSICAL_COLS:
+        assert c in C.FEATURE_NAMES_15
+
+
+def test_flood_keywords_cover_raw_and_text():
+    for k in ("洪涝", "洪水", "内涝", "渍涝", "山洪", "凌汛"):
+        assert k in C.FLOOD_TYPE_KEYWORDS
+    for k in ("洪涝", "山洪", "内涝", "渍涝", "洪水", "漫堤", "决口", "溃坝",
+              "淹没农田", "积水受淹"):
+        assert k in C.FLOOD_TEXT_KEYWORDS
+
+
+def test_dual_pool_constants():
+    assert C.K_IN_PROV == 4
+    assert C.K_CROSS_PROV == 3
+
+
+def test_flood_activation_rule_from_build_benchmarks():
+    from src.data.build_benchmarks import add_flood_activation
+
+    df = pd.DataFrame({
+        "disaster_type_14": ["暴雨", "暴雨", "干旱", "台风"],
+        "disaster_type": ["暴雨洪涝", "强降水", "干旱", "台风"],
+        "disaster_subtype": [None, None, None, "风暴潮"],
+        "impact_description": ["无", "无", "河道漫堤，洪水淹没农田", "无"],
+    })
+    out = add_flood_activation(df)
+    assert out.loc[0, "label_types"] == ["暴雨", "洪涝"]
+    assert out.loc[1, "label_types"] == ["暴雨"]
+    assert out.loc[2, "label_types"] == ["洪涝", "干旱"]  # 按 14 类索引排序
+    assert out.loc[3, "label_types"] == ["台风"]
+    assert out["flood_activated"].tolist() == [True, False, True, False]
+
+
+def test_text_recovery_recovers_unique_and_ambiguous():
+    from src.data.entity_align import apply_text_recovery
+
+    stations = pd.DataFrame({
+        "cnty_id": [0, 1, 2],
+        "Province": ["四川省", "四川省", "四川省"],
+        "City": ["德阳市", "德阳市", "绵阳市"],
+        "Cnty": ["中江县", "旌阳区", "涪城区"],
+    })
+    df = pd.DataFrame({
+        "cnty_id": [-1, -1, -1, 0],
+        "align_level": ["miss", "miss", "miss", "L1_exact"],
+        "province": ["四川省", "四川省", "四川省", "四川省"],
+        "city": ["四川省德阳市", "四川省德阳市", "四川省绵阳市", "四川省德阳市"],
+        "county": [None, None, None, "中江县"],
+        "report_unit": ["四川省德阳市中江县", "四川省德阳市中江县旌阳区", "四川省绵阳市", ""],
+        "impact_description": ["", "", "", ""],
+    })
+    out, stats = apply_text_recovery(df, stations)
+    assert stats["unique"] == 1
+    assert stats["multi"] == 1
+    assert stats["unresolved"] == 1
+    assert out.loc[0, "cnty_id"] == 0
+    assert out.loc[0, "align_level"] == "L4_text_unique"
+    assert out.loc[1, "align_level"] == "L4_text_multi"
+    assert out.loc[1, "cnty_id"] == -1
+    assert out.loc[1, "cont_loss_mask"] == 0
+    assert out.loc[2, "align_level"] == "miss"
+    # 长度守恒：不得因索引问题凭空增行
+    assert len(out) == len(df)

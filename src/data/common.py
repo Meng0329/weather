@@ -29,6 +29,8 @@ METEO_YEAR_GLOB = "Year_*.csv"
 KEY_COLS = ["Province", "City", "Cnty"]
 
 # 9 项连续要素（顺序即 16 维向量的前 9 维）
+# 注意：WIN_S_10mi_Avg 在 2018–2025 全量缺测（Phase 1.5 决议 §6.6），
+# 保留在 RAW 连续列中以供审计，但已从特征契约中剔除。
 CONTINUOUS_COLS = [
     "PRS_Avg",
     "WIN_S_Max",
@@ -41,11 +43,14 @@ CONTINUOUS_COLS = [
     "PRE_Time_2020",
 ]
 
+# Phase 1.5 决议 §6.6：剔除 WIN_S_10mi_Avg 后确立 15 维全时段可用特征契约。
+DROPPED_METEO_COLS = ["Lit", "Thund", "Tord", "WIN_S_10mi_Avg"]
+
 # 2 项全时段可用二值天气现象
 BINARY_COLS = ["GaWIN", "Fog"]
 
-# 仅存在于原始 20 列、但 2016-2025 全缺，按决议剔除
-DROPPED_METEO_COLS = ["Lit", "Thund", "Tord"]
+# 平流核的物理输入通道：3 维全时段无缺失物理量
+ADV_PHYSICAL_COLS = ["PRS_Avg", "WIN_S_Max", "WIN_S_2mi_Avg"]
 
 # 特殊特征值
 SENTINEL_MISSING = 999999.0  # 缺测
@@ -102,6 +107,26 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 assert N_FEATURES == 16, N_FEATURES
+
+# ---- Phase 1.5：建模用 15 维契约（剔除 WIN_S_10mi_Avg）----
+FEATURE_NAMES_15 = [f for f in FEATURE_NAMES if f not in DROPPED_METEO_COLS]
+assert len(FEATURE_NAMES_15) == 15, FEATURE_NAMES_15
+# 15 维 -> 落盘 16 维张量的列索引（读取时直接索引，无需重算 3GB 张量）
+FEATURE_IDX_15 = [FEATURE_NAMES.index(f) for f in FEATURE_NAMES_15]
+N_FEATURES_MODEL = 15
+
+# 平流核真正使用的 3 个**全时段无缺失**物理量（Phase 1.5 §6.6）。
+# 用 24h 变压而非绝对气压，才能刻画"气压梯度驱动风场平流"。
+ADV_KERNEL_FEATURES = ["delta_prs_24h", "WIN_S_Max", "WIN_S_2mi_Avg"]
+# 在 15 维建模契约中的通道位置（区域张量仅 15 维）
+ADV_KERNEL_IDX = [FEATURE_NAMES_15.index(f) for f in ADV_KERNEL_FEATURES]
+
+
+# 洪涝共激活规则的关键词（Phase 1.5 决议 §6.7）
+FLOOD_TYPE_KEYWORDS = ("洪涝", "洪水", "内涝", "渍涝", "山洪", "凌汛")
+FLOOD_TEXT_KEYWORDS = (
+    "洪涝", "山洪", "内涝", "渍涝", "洪水", "漫堤", "决口", "溃坝", "淹没农田", "积水受淹",
+)
 
 # --------------------------------------------------------------------------
 # 灾情数据契约
@@ -312,6 +337,13 @@ PROVINCE_ADJACENCY = {
 PHYSICAL_NEIGHBOR_K = 6  # 每个节点的物理近邻出边数
 ADV_WEIGHT_PRS = 0.5  # delta_prs_24h 相关系数权重
 ADV_WEIGHT_TEM = 0.5  # TEM_Avg 相关系数权重
+
+# ---- Phase 1.5 决议 §6.9：分层双池空间平流图 ----
+# 池 1：同地市连通 + 同省物理近邻 Top-K_IN_PROV
+# 池 2：邻省（区域子集内）物理近邻 Top-K_CROSS_PROV
+# 预期跨省边占比 20%~30%（Phase 1 实测仅 3.3%~5.4%）。
+K_IN_PROV = 4
+K_CROSS_PROV = 3
 
 # --------------------------------------------------------------------------
 # 派生特征工具

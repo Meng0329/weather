@@ -403,6 +403,48 @@ docs/paper/    # 论文各章节 Markdown/LaTeX 源码与实验结果表格汇�
 3. `w/o LLM Constitutive Functional`
 4. **`w/o Assimilation & RAG Prior`**（原"w/o 99xxxx 编码消融"已作废——§4.1 证明该编码不存在）
 
+### 6.6 Phase 1.5 决议：剔除 WIN_S_10mi_Avg，确立 15 维契约
+
+- 建模输入固定为 **15 维**：`FEATURE_NAMES_15 = FEATURE_NAMES - {WIN_S_10mi_Avg}`，
+  索引映射由 `C.FEATURE_IDX_15` 给出。
+- 落盘的 `datasets/processed/meteo_features.npy` 仍为 16 维（不重算 3 GB 张量），
+  区域基准构建时按 `FEATURE_IDX_15` 索引出 15 维并写入 `<REGION>/meteo_features.npy`
+  （`feature_contract.json` 记录通道名）。
+- **平流核物理输入固定为 3 维**：`[ΔPRS, WIN_S_Max, WIN_S_2mi_Avg]`
+  （`C.ADV_PHYSICAL_COLS`），三者全时段无缺失。
+
+### 6.7 Phase 1.5 决议：洪涝多标签相变激活
+
+`A_topo` 是 14 类灾害的**多标签二值向量**，不是互斥单分类。除主类外，附加规则：
+
+- 原始 `disaster_type` 命中 `洪涝|洪水|内涝|渍涝|山洪|凌汛` → 激活 `洪涝`
+  （含 70,158 条 `暴雨洪涝`，使其**同时**激活 `暴雨` 与 `洪涝`）；
+- `disaster_subtype` 或 `impact_description` 命中
+  `洪涝|山洪|内涝|渍涝|洪水|漫堤|决口|溃坝|淹没农田|积水受淹` → 激活 `洪涝`。
+- 级联正样本：`暴雨洪涝` 且 `duration_days >= 2` 记一个 `暴雨→洪涝` 对；
+  同区县内洪涝激活后 `[t, t+3]` 天出现 `地质灾害` 记一个 `暴雨→洪涝→地质灾害` 三元链。
+- 实测：全库洪涝激活 **72,080** 条记录（原单标签口径仅 36 条）。
+
+### 6.8 Phase 1.5 决议：市级记录文本二次下探（Text-Guided County Recovery）
+
+对 `county` 为空但 `province`/`city` 已知的记录，在该地市下辖 `Cnty` 名集合中检索
+`report_unit` 与 `impact_description`（完整区县名命中，或长度 ≥3 的词干命中）：
+
+- **唯一命中** → 完整纳入该区县监督（`align_level = L4_text_unique`，`cont_loss_mask = 1`）；
+- **多候选** → 仅在候选区县上激活 `A_topo`，`align_level = L4_text_multi`，
+  **`cont_loss_mask = 0`**（避免均摊损失造成空间污染）；
+- **仍无命中** → 剔除并在 `data_stats.md` 披露。
+
+记录展开为 record→node 链接（`records.parquet`），`n_records_unique` 与
+`n_record_node_links` 分别统计。
+
+### 6.9 Phase 1.5 决议：分层双池空间平流图
+
+- 池 1（同域）：同地市完全连通 + 同省内相关系数 **Top-4**（`C.K_IN_PROV`）；
+- 池 2（跨域）：相邻省份（限区域子集内）相关系数 **Top-3**（`C.K_CROSS_PROV`）；
+- 仍只用训练期（2000–2018）序列计算相关，只保留正相关边。
+- 目标跨省边占比 20%~30%（Phase 1 双池前仅 3.3%~5.4%）。
+
 ---
 
 ## 7. Phase 1 交付状态（2026-10-20 已完成并实测）
@@ -442,17 +484,87 @@ docs/paper/    # 论文各章节 Markdown/LaTeX 源码与实验结果表格汇�
 - Task 3 金标准：多阶段链 **3,863**（初报+终报 3,617，含完整三阶段 **246**），
   记录 17,067（初报 8,864 / 终报 7,150 / 续报 1,053）。
 
-### 8.3 Phase 1 暴露、需规划者裁决的遗留问题
+### 8.3 Phase 1 暴露的 4 项遗留问题（已由 Phase 1.5 全部裁决，见 §6.6–§6.9）
 
-1. **`洪涝` 类几乎为空**：全库仅 36 条（来自 `凌汛`），SW-Cascade 内 12 条、SE-Typhoon 0 条。
-   "暴雨→洪涝→地质灾害"三级级联缺少中间节点监督。需决定：是否从 `disaster_subtype` /
-   `impact_description` 文本重新抽取洪涝节点（原始 `暴雨洪涝` 已被标准化为 `暴雨`，70,158 条）。
-2. **`WIN_S_10mi_Avg` 应从建模特征中剔除**：2018–2025 全缺，val/test 恒为掩码填充值。
-   建议有效特征维度定为 **15**。
-3. **区县对齐上限 ~72.5%**：剩余缺口主要是只有市级、无区县的记录（19.3% 全库）。
-   若论文需要更高的对齐率，需引入区县实体链接或按市级聚合的降级方案。
-4. **邻接图跨省边占比仅 3.3%–5.4%**：Top-K 物理近邻绝大多数落在同省内，
-   跨省台风通道偏弱。可考虑把 `PHYSICAL_NEIGHBOR_K` 提高或改用跨省候选池加权。
+1. ~~`洪涝` 类几乎为空~~ → **§6.7 已裁决**：改多标签共激活，全库洪涝激活 36 → **72,080**。
+2. ~~`WIN_S_10mi_Avg` 应从建模特征中剔除~~ → **§6.6 已裁决**：建模固化为 **15 维**。
+3. ~~区县对齐上限 ~72.5%~~ → **§6.8 已裁决**：文本二次下探，对齐率 → **75.81%**。
+4. ~~跨省边占比仅 3.3%–5.4%~~ → **§6.9 已裁决**：分层双池图，跨省边 → **22.2%~29.5%**。
+
+---
+
+## 9. Phase 1.5 + Phase 2 交付状态（2026-10-20 已完成并实测）
+
+### 9.1 新增代码
+
+| 文件 | 作用 |
+|---|---|
+| `src/llm/extract_constitutive_emb.py` | 双模式本构语义提取：内网 API（Qwen3-Embedding-0.6B + bge-reranker-v2-m3 两阶段 RAG）/ 本地 transformers / 确定性 TF-IDF 三级降级 |
+| `src/models/pt_gno.py` | PT-GNO 主模型：`LLMConstitutiveFunctional`、`PhysicsAdvectionReactionCell`、`GATAdvectionCell`、`LandauPhaseTransitionReadout` |
+| `src/models/baselines.py` | Stitched-GNN-LLM、GraphWaveNet、GRU-GCN、PDE-GCN、RE-GCN 五族基线 |
+| `src/models/ablations.py` | 4 个受控消融（仅切 §6.5 中一项） |
+| `src/engine/data.py` | 整窗采样、稀疏文本查找表、训练期标准化、多尺度损失目标 |
+| `src/engine/trainer.py` | 变分自由能损失（Focal BCE + 加权 CE + Masked Huber + β·KL）与 6 类指标 |
+| `scripts/train_pt_gno.py` | 训练/消融/基线一键入口（`--suite` 全量） |
+| `tests/test_models.py` | 39 项模型单元测试 |
+
+### 9.2 Phase 1.5 实测数字
+
+- **洪涝多标签激活**：SW-Cascade 19,080（train 10,525 / val 4,383 / test 4,172）、
+  SE-Typhoon 3,784、North-Agro 5,742；全库 flag **72,080** 条记录。
+- **级联正样本**：`暴雨→洪涝` 对 5,403 / 1,156 / 1,324；
+  `暴雨→洪涝→地质灾害` 三元链 **336 / 17 / 3**（SW-Cascade 是唯一有统计量级的区域，与选题一致）。
+- **文本二次下探**：唯一命中 **2,913**（`L4_text_unique`，`cont_loss_mask=1`）、
+  多候选 **1,936**（`L4_text_multi`，仅激活 `A_topo`，`cont_loss_mask=0`）、
+  仍无命中 35,876（披露）。对齐率 **72.54% → 75.81%**。
+- **分层双池邻接图**（跨省边占比目标 20%~30%，全部达标）：
+  | 区域 | 节点 | 边 | 跨省边 | 跨省占比 | 平均出度 |
+  |---|---:|---:|---:|---:|---:|
+  | SW-Cascade | 398 | 5,388 | 1,194 | **22.2%** | 13.54 |
+  | SE-Typhoon | 353 | 3,587 | 1,058 | **29.5%** | 10.16 |
+  | North-Agro | 589 | 7,084 | 1,764 | **24.9%** | 12.03 |
+
+### 9.3 Phase 2 关键设计决议（实现中固化，论文须如实表述）
+
+1. **15 维建模契约**：`C.FEATURE_NAMES_15` + `C.FEATURE_IDX_15`；落盘张量仍 16 维，
+   区域基准按索引切出 15 维（`<REGION>/feature_contract.json` 记录通道名）。
+2. **平流核物理输入 3 维**：`C.ADV_KERNEL_IDX = [delta_prs_24h, WIN_S_Max, WIN_S_2mi_Avg]`
+   （用 **24h 变压**而非绝对气压，才是"气压梯度驱动平流"）。
+3. **平流项保守化**：无向邻接图按**无向对**处理（`min/max` 规范化 + 每对只算一次），
+   对 a 贡献 `-g(U_a-U_b)`、对 b 贡献 `+g(U_a-U_b)`，能量严格守恒。
+   传导率 `g` 只依赖物理对（`|ΔP|`、两端风速），不伪造风向。
+4. **禁止 LayerNorm 作用于状态变量 U**：相变门控读的正是 `RMS(U)`，
+   逐节点标准化会把幅值抹平、使门控退化为常数。改用可学习全局 RMS 上限的
+   **平滑饱和** `U *= cap·tanh(rms/cap)/rms`，既防爆炸又保留节点间幅值次序。
+5. **门控用 RMS 而非裸 L2**：`phase_gate = σ((RMS(U) - τ)/ε)`，τ 由本构泛函给出
+   （`softplus` + 基座，恒正），保证"亚临界静默 / 超临界激活"的物理可解释性。
+6. **`A_topo` 是 14 类多标签**（逐类 sigmoid，行和可 > 1），不是 14 类互斥 softmax；
+   级联项为 `W_cascade(Θ) @ z`，`W_cascade` 是 14×14 **节点级**低秩增量 + 静态基座。
+7. **文本两级泄露防护**：`h_cur` 只编码灾前可见文本（`weather_summary` / `warning_info` /
+   `remarks`）；`h_post`（`impact_description`）**仅**在 Task 3 观测到达时刻经
+   `assim_mask` 注入；`h_rag` 只在训练集语料内检索。
+8. **四类损失可加权求和**：`L_FreeEnergy = L_topo + 0.5·L_level + 0.5·L_cont + β·KL`，
+   β 前 10 轮线性退火；Focal BCE 用 `pos_weight = clip(sqrt(neg/pos), 1, 20)` 平衡长尾。
+9. **指标口径**：Hits@3 只在真有灾种的样本上统计（随机基线 = 3/14 ≈ 0.214），
+   不得用全体样本均值充数（会被海量空样本稀释成假高分）。
+
+### 9.4 Phase 2 冒烟实测（SW-Cascade，2 epoch）
+
+- 数据：train 6,933 整窗（`T_in=7`, `Δ=1`）；正样本率 0.386%（14 类长尾极端不均）。
+- 模型：PT-GNO 295k 参数（`d_model=128`）。
+- 结果：train loss 1.37 → 1.05 单调下降，val loss 1.20 → 1.15，指标全部正常输出
+  （Macro-F1 / AUPRC / Hits@3 / log-MAE / R²），显存占用 < 1 GB。
+- 结论：管线端到端贯通；正式训练需 ≥100 epoch + 5 seed（§5.4）。
+
+### 9.5 离线本构语义服务（内网，`10.200.37.71:8801`）
+
+- 嵌入：`Qwen3-Embedding-0.6B`（原生 1024 维，按 MRL 截断到 **512** 维并重新归一化）。
+  通过 `LLM_API_BASE` / `LLM_API_KEY` 环境变量注入，脚本内**不硬编码任何凭据**。
+- 精排：`bge-reranker-v2-m3`，用于 RAG 两阶段检索（稠密粗召回 Top-20 → 精排 Top-3）。
+- 生成模型（Qwen3.5-9B / GLM-5.1 / DeepSeek-V4 等）**不进入训练回路**，
+  仅可用于离线蒸馏语料构造；CLAUDE.md §1.3 的"离线蒸馏优先"原则不变。
+- 吞吐实测：嵌入 batch=128 / 并发 64 → ≈ **250 texts/s**（受服务端队列限制）；
+  rerank ≈ 0.05 s/请求。**密钥与地址只从环境变量读取，禁止写入仓库**。
 
 ---
 
