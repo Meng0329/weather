@@ -1,0 +1,27 @@
+# 数据文件（体积大，超 GitHub 单文件 100MB 限制，本地保留）
+datasets/
+
+# 已安装的技能/工具副本（体积大，非项目内容）
+.claude/skills/
+.codex/skills/
+.agents/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+
+# 输出与缓存
+outputs/
+*.log
