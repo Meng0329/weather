@@ -240,7 +240,7 @@ class APIEncoder:
     # -- 单请求 -------------------------------------------------------
     MAX_CHARS = 1200          # 单条文本截断长度（超出模型上下文的记录会 500）
 
-    def _post(self, texts: list[str]) -> np.ndarray:
+    def _post(self, texts: list[str], _depth: int = 0) -> np.ndarray:
         import urllib.request
 
         texts = [t[: self.MAX_CHARS] if t else "无" for t in texts]
@@ -260,12 +260,14 @@ class APIEncoder:
             except Exception as e:                      # noqa: BLE001
                 last = e
                 time.sleep(0.4 * (attempt + 1))
-        # 整批失败：对半拆分递归（定位到单条脏数据），保证长跑不中断
-        if len(texts) > 1:
+        # 整批失败：对半拆分递归（定位到单条脏数据）。必须限制深度，
+        # 否则服务整体不可用时会把 1 次失败放大成 2^depth 次超时请求、看起来像死锁。
+        if len(texts) > 1 and _depth < 3:
             mid = len(texts) // 2
-            return np.vstack([self._post(texts[:mid]), self._post(texts[mid:])])
-        log.warning("单条文本嵌入失败，置零向量：%s", last)
-        return np.zeros((1, self.raw_dim), dtype=np.float32)
+            return np.vstack([self._post(texts[:mid], _depth + 1),
+                              self._post(texts[mid:], _depth + 1)])
+        log.warning("嵌入失败（%d 条，depth=%d），置零向量：%s", len(texts), _depth, last)
+        return np.zeros((len(texts), self.raw_dim), dtype=np.float32)
 
     def fit(self, texts: list[str]) -> "APIEncoder":
         # 探测：拿一条真实文本确认维度与协议
