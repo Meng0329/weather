@@ -160,3 +160,34 @@
 - 门控诊断：条件概率 σ(logits) 相比联合概率 F1ₐ 0.202→0.209、AUPRCₐ 0.197→0.225。
 
 结论与局限详见 `docs/paper/experimental_results.md` 末节。
+
+## Phase 3.5：条件化类型监督与全量复跑（2026-10-21）
+
+### 动机
+
+Phase 3 主表暴露：PT-GNO 在 Macro-F1 上三区域均落后 Stitched-GNN-LLM，
+且 `w/o Phase-Transition Gate` 与主模型无差异（p=0.804）——
+后者意味着"相变门控"这个核心主张没有证据支持。
+
+### 根因
+
+`topo_prob = gate · σ(logit)` 用一个 Focal BCE 同时训练"是否有灾"和"是哪一类"。
+SW-Cascade 节点-日正样本率仅 0.58%，98% 以上的空样本主导梯度 → 类型概率被整体压低。
+论文自己的数学式 P(A)=P(相变)·P(类型|相变) 从未真正落到损失里。
+
+### 修复与验证
+
+1. `LossConfig.type_cond_only=True`：类型 Focal BCE 只在"有灾"节点-日上计算，
+   门控单独承担事件检测。SW-Cascade 5 seeds：F1ₐ 0.194→0.205 (p=0.006)、
+   AUPRCₐ 0.193→0.217 (p=0.001)、H@3 0.893→0.908 (p=0.008)。
+2. `phase_learnable` 声明：无门控消融与全部基线退回联合似然，避免结构性惩罚
+   （否则门控消融会被假性放大，见 `docs/design_decisions.md` §4）。
+3. 全量复跑 150 runs（3 区域 × 10 模型 × 5 seeds），0 失败，结果见
+   `docs/paper/experimental_results.md`。
+
+### 复跑后的结论
+
+- 消融方向全部符合架构主张：本构泛函最强（三区域 p<0.005），
+  门控的贡献转移到 Hits@3（掉 0.10~0.12）。
+- 与缝合基线的 Macro-F1 差距收敛到 0.025 左右（SW/SE 不显著，NA 仍显著 p=0.0004）。
+- Task 3 同化为三区域一致的负结果（ERR −18%~−64%），如实披露。
