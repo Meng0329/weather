@@ -71,6 +71,11 @@ class LossConfig:
     focal_gamma: float = 2.0
     huber_delta: float = 1.0
     w_phase: float = 0.5      # 相变门控的相位监督权重（因子化似然）
+    # 因子化似然的条件化类型监督：只在"确实有灾"的节点-日上监督 14 类判别。
+    # 不这样做时，98% 以上的空样本主导类型头梯度，类型概率被整体压低，
+    # 联合概率 gate·σ(logit) 的排序因此劣于纯 GNN 基线（实测 F1a 落后 0.035）。
+    w_type: float = 0.5
+    type_cond_only: bool = True
 
 
 def free_energy_loss(out: dict, batch: dict, cfg: LossConfig, epoch: int,
@@ -84,8 +89,21 @@ def free_energy_loss(out: dict, batch: dict, cfg: LossConfig, epoch: int,
     topo_logits = out.get("topo_logits")
     if topo_logits is None:
         topo_logits = torch.logit(out["topo_prob"].float().clamp(1e-6, 1 - 1e-6))
-    l_topo = focal_bce(topo_logits, batch["topo"], gamma=cfg.focal_gamma,
-                       pos_weight=batch.get("pos_weight"))
+    # 类型判别：因子化似然 P(A)=P(相变)·P(类型|相变)。
+    # `type_cond_only` 时只在正样本节点-日上算 Focal BCE（条件似然），
+    # 相位与"是否有灾"由门控单独承担；否则退回联合似然。
+    pt = batch.get("phase_target")
+    # 条件似然的前提是"检测由门控负责"。无门控消融/基线的相位由多标签输出导出，
+    # 类型头必须同时承担检测，因此退回联合似然。
+    cond_ok = bool(out.get("phase_learnable", True))
+    if cfg.type_cond_only and cond_ok and pt is not None:
+        # boolean indexing 后是一维张量，focal_bce 对任意形状逐元素算，直接传入即可
+        m = pt.unsqueeze(-1).expand_as(topo_logits) > 0
+        l_type = (focal_bce(topo_logits[m], batch["topo"][m], gamma=cfg.focal_gamma)
+                  if bool(m.any()) else topo_logits.new_zeros(()))
+    else:
+        l_type = focal_bce(topo_logits, batch["topo"], gamma=cfg.focal_gamma,
+                           pos_weight=batch.get("pos_weight"))
     l_lvl = weighted_ce(out["level_logits"], batch["level"], batch["level_mask"],
                         class_weight=class_weight)
     l_cnt = masked_huber(out["cont"], batch["cont"], batch["cont_mask"], cfg.huber_delta)
@@ -93,7 +111,7 @@ def free_energy_loss(out: dict, batch: dict, cfg: LossConfig, epoch: int,
     # 若只监督联合项，门控在"几乎无正样本"时会退化为先验（恒 0），
     # 类型头随即失去梯度；直接用"该节点-日是否有灾"监督门控，
     # 等价于把**临界阈值 τ** 直接学成事件检测器。
-    l_ph = torch.zeros((), device=l_topo.device)
+    l_ph = torch.zeros((), device=l_type.device)
     if batch.get("phase_target") is not None:
         if out.get("phase_logit") is not None:      # PT-GNO：直接监督朗道门控
             phase_logit = out["phase_logit"]
@@ -102,10 +120,10 @@ def free_energy_loss(out: dict, batch: dict, cfg: LossConfig, epoch: int,
             phase_logit = torch.logit(p_any.clamp(1e-6, 1 - 1e-6))
         l_ph = F.binary_cross_entropy_with_logits(phase_logit, batch["phase_target"])
     beta = cfg.beta_max * min(1.0, epoch / max(cfg.beta_warmup, 1))
-    kl = out.get("kl", torch.zeros((), device=l_topo.device))
-    total = (cfg.w_topo * l_topo + cfg.w_level * l_lvl + cfg.w_cont * l_cnt
+    kl = out.get("kl", torch.zeros((), device=l_type.device))
+    total = (cfg.w_type * l_type + cfg.w_level * l_lvl + cfg.w_cont * l_cnt
              + cfg.w_phase * l_ph + beta * kl)
-    return total, {"topo": float(l_topo.detach()), "level": float(l_lvl.detach()),
+    return total, {"topo": float(l_type.detach()), "level": float(l_lvl.detach()),
                    "cont": float(l_cnt.detach()), "phase": float(l_ph.detach()),
                    "kl": float(kl.detach()), "beta": beta}
 

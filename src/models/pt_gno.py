@@ -340,6 +340,9 @@ class LandauPhaseTransitionReadout(nn.Module):
         # 无条件/全网格推断：亚临界节点（gate < 阈值）的损失读出置零（图谱静默）。
         cont_full = cont_cond * (gate.unsqueeze(-1) >= self.gate_zero_threshold)
         return {"topo_prob": topo_prob, "topo_logits": logits,
+                # 无门控消融（gate≡1）没有可学习的相位通路，损失侧必须退回联合似然，
+                # 否则类型头只在正样本上训练、又无门控压制负样本 → 消融被结构性惩罚
+                "phase_learnable": self.use_phase_gate,
                 "phase_gate": gate, "phase_logit": torch.logit(
                     gate.clamp(1e-6, 1 - 1e-6)),
                 "level_logits": level_logits,
