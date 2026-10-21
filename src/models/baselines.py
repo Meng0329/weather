@@ -14,7 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.pt_gno import (NUM_CONT, NUM_DISASTERS, NUM_LEVELS, GNOConfig, PT_GNO)
+from src.models.pt_gno import (NUM_CONT, NUM_DISASTERS, NUM_LEVELS, ContMeanMixin,
+                               GNOConfig, PT_GNO)
 
 
 def _mlp(i, h, o, drop=0.1):
@@ -28,9 +29,11 @@ def _scatter_msg(H, edge_index, edge_w, aggregate: str = "mean"):
     """
     src, dst = edge_index[0], edge_index[1]
     B, N, D = H.shape
-    w = edge_w.view(1, -1).clamp_min(0.0).expand(B, -1)
+    # AMP 下 H 可能是 float16 而 edge_w 恒为 float32：scatter_add_ 要求
+    # 累加器与源同 dtype，这里统一到 H.dtype（否则 5 个基线在 fp16 下全崩）。
+    w = edge_w.view(1, -1).to(H.dtype).clamp_min(0.0).expand(B, -1)
     deg = w.new_zeros((B, N)).scatter_add_(1, dst.view(1, -1).expand(B, -1), w).clamp_min(1e-6)
-    msg = w.unsqueeze(-1) * H[:, src]
+    msg = (w.unsqueeze(-1) * H[:, src]).to(H.dtype)
     out = H.new_zeros((B, N, D)).scatter_add_(
         1, dst.view(1, -1, 1).expand(B, -1, D), msg)
     return out / deg.unsqueeze(-1) if aggregate == "mean" else out
@@ -39,7 +42,7 @@ def _scatter_msg(H, edge_index, edge_w, aggregate: str = "mean"):
 # ==========================================================================
 # 1) Stitched-GNN-LLM：GCN + 文本 MLP 末端拼接（论文要批判的对象）
 # ==========================================================================
-class StitchedGNNLLM(nn.Module):
+class StitchedGNNLLM(ContMeanMixin, nn.Module):
     """审稿人对照：`torch.cat([h_gnn, h_llm])` 式末端融合 + 无物理内置结构。
 
     与 PT-GNO 参数量对齐（±10%），差异仅在"拼接而非本征参数注入"。
@@ -54,6 +57,7 @@ class StitchedGNNLLM(nn.Module):
         self.topo = _mlp(d_model * 2, hidden, NUM_DISASTERS, dropout)
         self.level = _mlp(d_model * 2, hidden, NUM_LEVELS, dropout)
         self.cont = _mlp(d_model * 2, hidden, NUM_CONT, dropout)
+        self.init_cont_mean()
 
     def forward(self, batch):
         x = batch["x"]
@@ -70,15 +74,17 @@ class StitchedGNNLLM(nn.Module):
         # GNN 分支给出**全局**图状态（节点维被均值池化掉），
         # LLM 分支给出**节点**文本，二者在末端拼接 —— 正是缝合基线的缺陷所在。
         g_state = H.mean(dim=2)[:, -1]                                  # (B,d)
-        tvec = self.text(torch.cat([batch["h_cur"][:, -1],
-                                    batch.get("h_rag", batch["h_cur"])[:, -1]], -1))  # (B,N,d)
+        tvec = self.text(torch.cat([batch["h_cur"],
+                                    batch.get("h_rag", batch["h_cur"])], -1))  # (B,N,d)
         fuse = self.norm(torch.cat([g_state.unsqueeze(1).expand(-1, tvec.shape[1], -1),
                                     tvec], dim=-1))                     # (B,N,2d)
         fz = fuse                                            # (B,N,2d)
+        topo_logits = self.topo(fz)
         return {
-            "topo_prob": torch.sigmoid(self.topo(fz)),
+            "topo_prob": torch.sigmoid(topo_logits),
+            "topo_logits": topo_logits,
             "level_logits": self.level(fz),
-            "cont": F.relu(self.cont(fz)),
+            "cont": F.softplus(self.cont(fz) + self.cont_pos_mean),
             "phase_gate": torch.ones(x.shape[0], x.shape[2], device=x.device),
         }
 
@@ -86,7 +92,7 @@ class StitchedGNNLLM(nn.Module):
 # ==========================================================================
 # 2) GraphWaveNet 风格：自适应邻接 + 膨胀因果卷积
 # ==========================================================================
-class GraphWaveNetLite(nn.Module):
+class GraphWaveNetLite(ContMeanMixin, nn.Module):
     def __init__(self, n_features=15, text_dim=256, d_model=128, hidden=128,
                  dropout=0.1, n_nodes=400, dilation=(1, 2, 4)):
         super().__init__()
@@ -99,6 +105,18 @@ class GraphWaveNetLite(nn.Module):
         self.adj_proj2 = nn.Linear(10, d_model)
         self.text = _mlp(text_dim * 2, hidden, d_model, dropout)
         self.head = _mlp(d_model, hidden, NUM_DISASTERS + NUM_LEVELS + NUM_CONT, dropout)
+        self.init_cont_mean()
+
+    def _node_emb_for(self, n: int) -> torch.Tensor:
+        """自适应节点嵌入：三个基准节点数不同（353/398/589），
+        固定 `n_nodes=400` 会在 North_Agro(589) 上截断成 (400,10)，
+        与 (B,589,d) 的状态做 einsum 时直接报错。这里按需扩展。"""
+        cur = self.node_emb.shape[0]
+        if n <= cur:
+            return self.node_emb[:n]
+        pad = self.node_emb.new_zeros(n - cur, self.node_emb.shape[1]).normal_(std=0.1)
+        self.node_emb = nn.Parameter(torch.cat([self.node_emb.data, pad], dim=0))
+        return self.node_emb
 
     def forward(self, batch):
         x = batch["x"]                                    # (B,T,N,F)
@@ -109,24 +127,25 @@ class GraphWaveNetLite(nn.Module):
         for c in self.tcn:
             h = h + F.gelu(c(h)[..., :T])
         h = h[..., -1].reshape(B, N, -1)
-        emb = self.node_emb[:N]
+        emb = self._node_emb_for(N)
         a = F.softmax(F.relu(self.adj_proj(emb) @ self.adj_proj2(emb).T), dim=-1)
         h = h + torch.einsum("nm,bmd->bnd", a, h)
-        hc = batch["h_cur"][:, -1]                      # (B,N,D)
-        hr = batch.get("h_rag", batch["h_cur"])[:, -1]
+        hc = batch["h_cur"]                      # (B,N,D)
+        hr = batch.get("h_rag", batch["h_cur"])
         tvec = self.text(torch.cat([hc, hr], -1))       # (B,N,d)
         h = h + tvec
         o = self.head(h)
         return {"topo_prob": torch.sigmoid(o[..., :NUM_DISASTERS]),
+                "topo_logits": o[..., :NUM_DISASTERS],
                 "level_logits": o[..., NUM_DISASTERS:NUM_DISASTERS + NUM_LEVELS],
-                "cont": F.relu(o[..., NUM_DISASTERS + NUM_LEVELS:]),
+                "cont": F.softplus(o[..., NUM_DISASTERS + NUM_LEVELS:] + self.cont_pos_mean),
                 "phase_gate": torch.ones(B, N, device=x.device)}
 
 
 # ==========================================================================
 # 3) GRU-GCN：时空循环聚合
 # ==========================================================================
-class GRUGCN(nn.Module):
+class GRUGCN(ContMeanMixin, nn.Module):
     def __init__(self, n_features=15, text_dim=256, d_model=128, hidden=128, dropout=0.1):
         super().__init__()
         self.enc = _mlp(n_features, hidden, d_model, dropout)
@@ -134,6 +153,7 @@ class GRUGCN(nn.Module):
         self.gcn = nn.Linear(d_model, d_model)
         self.text = _mlp(text_dim * 2, hidden, d_model, dropout)
         self.head = _mlp(d_model, hidden, NUM_DISASTERS + NUM_LEVELS + NUM_CONT, dropout)
+        self.init_cont_mean()
 
     def forward(self, batch):
         x = batch["x"]
@@ -145,20 +165,21 @@ class GRUGCN(nn.Module):
         out, hN = self.gru(h)                  # out:(B*N,T,d), hN:(1,B*N,d)
         hT = hN[0].reshape(B, N, -1)           # (B,N,d)
         hT = hT + _scatter_msg(self.gcn(hT), batch["edge_index"], batch["edge_w"])
-        hc = batch["h_cur"][:, -1]
-        hr = batch.get("h_rag", batch["h_cur"])[:, -1]
+        hc = batch["h_cur"]
+        hr = batch.get("h_rag", batch["h_cur"])
         hT = hT + self.text(torch.cat([hc, hr], -1))
         o = self.head(hT)
         return {"topo_prob": torch.sigmoid(o[..., :NUM_DISASTERS]),
+                "topo_logits": o[..., :NUM_DISASTERS],
                 "level_logits": o[..., NUM_DISASTERS:NUM_DISASTERS + NUM_LEVELS],
-                "cont": F.relu(o[..., NUM_DISASTERS + NUM_LEVELS:]),
+                "cont": F.softplus(o[..., NUM_DISASTERS + NUM_LEVELS:] + self.cont_pos_mean),
                 "phase_gate": torch.ones(B, N, device=x.device)}
 
 
 # ==========================================================================
 # 4) PDE-GCN：物理图上的扩散（有物理图但无相变门控与本征泛函）
 # ==========================================================================
-class PDEGCN(nn.Module):
+class PDEGCN(ContMeanMixin, nn.Module):
     def __init__(self, n_features=15, adv_dim=3, text_dim=256, d_model=128,
                  hidden=128, dropout=0.1, n_steps=3):
         super().__init__()
@@ -168,6 +189,7 @@ class PDEGCN(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.text = _mlp(text_dim * 2, hidden, d_model, dropout)
         self.head = _mlp(d_model, hidden, NUM_DISASTERS + NUM_LEVELS + NUM_CONT, dropout)
+        self.init_cont_mean()
         self.n_steps = n_steps
 
     def forward(self, batch):
@@ -187,20 +209,21 @@ class PDEGCN(nn.Module):
             lap = -msg.new_zeros((B, N, U.shape[-1])).scatter_add_(
                 1, src.view(1, -1, 1).expand(B, -1, U.shape[-1]), msg)
             U = self.norm(U + self.step(U) - lap / deg.clamp_min(1e-6).unsqueeze(-1))
-        hc = batch["h_cur"][:, -1]
-        hr = batch.get("h_rag", batch["h_cur"])[:, -1]
+        hc = batch["h_cur"]
+        hr = batch.get("h_rag", batch["h_cur"])
         U = U + self.text(torch.cat([hc, hr], -1))
         o = self.head(U)
         return {"topo_prob": torch.sigmoid(o[..., :NUM_DISASTERS]),
+                "topo_logits": o[..., :NUM_DISASTERS],
                 "level_logits": o[..., NUM_DISASTERS:NUM_DISASTERS + NUM_LEVELS],
-                "cont": F.relu(o[..., NUM_DISASTERS + NUM_LEVELS:]),
+                "cont": F.softplus(o[..., NUM_DISASTERS + NUM_LEVELS:] + self.cont_pos_mean),
                 "phase_gate": torch.ones(B, N, device=x.device)}
 
 
 # ==========================================================================
 # 5) RE-GCN 风格：时序知识图谱演化（关系感知 GRU 更新）
 # ==========================================================================
-class REGCNLite(nn.Module):
+class REGCNLite(ContMeanMixin, nn.Module):
     def __init__(self, n_features=15, text_dim=256, d_model=128, hidden=128,
                  dropout=0.1, n_rel=4):
         super().__init__()
@@ -210,6 +233,7 @@ class REGCNLite(nn.Module):
         self.gru = nn.GRUCell(d_model, d_model)
         self.text = _mlp(text_dim * 2, hidden, d_model, dropout)
         self.head = _mlp(d_model, hidden, NUM_DISASTERS + NUM_LEVELS + NUM_CONT, dropout)
+        self.init_cont_mean()
 
     def forward(self, batch):
         x = batch["x"]
@@ -225,13 +249,14 @@ class REGCNLite(nn.Module):
                 m = _scatter_msg(torch.tanh(self.w_rel(H) + self.rel[r]), e, w)
                 agg = agg + m / self.rel.shape[0]
             H = self.gru((h[:, t] + agg).reshape(B * N, -1)).view(B, N, -1)
-        hc = batch["h_cur"][:, -1]
-        hr = batch.get("h_rag", batch["h_cur"])[:, -1]
+        hc = batch["h_cur"]
+        hr = batch.get("h_rag", batch["h_cur"])
         H = H + self.text(torch.cat([hc, hr], -1))
         o = self.head(H)
         return {"topo_prob": torch.sigmoid(o[..., :NUM_DISASTERS]),
+                "topo_logits": o[..., :NUM_DISASTERS],
                 "level_logits": o[..., NUM_DISASTERS:NUM_DISASTERS + NUM_LEVELS],
-                "cont": F.relu(o[..., NUM_DISASTERS + NUM_LEVELS:]),
+                "cont": F.softplus(o[..., NUM_DISASTERS + NUM_LEVELS:] + self.cont_pos_mean),
                 "phase_gate": torch.ones(B, N, device=x.device)}
 
 

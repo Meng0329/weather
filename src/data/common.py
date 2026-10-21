@@ -29,7 +29,7 @@ METEO_YEAR_GLOB = "Year_*.csv"
 KEY_COLS = ["Province", "City", "Cnty"]
 
 # 9 项连续要素（顺序即 16 维向量的前 9 维）
-# 注意：WIN_S_10mi_Avg 在 2018–2025 全量缺测（Phase 1.5 决议 §6.6），
+# 注意：WIN_S_10mi_Avg 在 2018–2025 全量缺测（Phase 1.5 决议 `docs/experiment_protocol.md` §3.2），
 # 保留在 RAW 连续列中以供审计，但已从特征契约中剔除。
 CONTINUOUS_COLS = [
     "PRS_Avg",
@@ -43,7 +43,7 @@ CONTINUOUS_COLS = [
     "PRE_Time_2020",
 ]
 
-# Phase 1.5 决议 §6.6：剔除 WIN_S_10mi_Avg 后确立 15 维全时段可用特征契约。
+# Phase 1.5 决议（`docs/experiment_protocol.md` §3.2）：剔除 WIN_S_10mi_Avg 后确立 15 维全时段可用特征契约。
 DROPPED_METEO_COLS = ["Lit", "Thund", "Tord", "WIN_S_10mi_Avg"]
 
 # 2 项全时段可用二值天气现象
@@ -115,14 +115,14 @@ assert len(FEATURE_NAMES_15) == 15, FEATURE_NAMES_15
 FEATURE_IDX_15 = [FEATURE_NAMES.index(f) for f in FEATURE_NAMES_15]
 N_FEATURES_MODEL = 15
 
-# 平流核真正使用的 3 个**全时段无缺失**物理量（Phase 1.5 §6.6）。
+# 平流核真正使用的 3 个**全时段无缺失**物理量（Phase 1.5 `docs/experiment_protocol.md` §3.2）。
 # 用 24h 变压而非绝对气压，才能刻画"气压梯度驱动风场平流"。
 ADV_KERNEL_FEATURES = ["delta_prs_24h", "WIN_S_Max", "WIN_S_2mi_Avg"]
 # 在 15 维建模契约中的通道位置（区域张量仅 15 维）
 ADV_KERNEL_IDX = [FEATURE_NAMES_15.index(f) for f in ADV_KERNEL_FEATURES]
 
 
-# 洪涝共激活规则的关键词（Phase 1.5 决议 §6.7）
+# 洪涝共激活规则的关键词（Phase 1.5 决议 `docs/experiment_protocol.md` §3.3）
 FLOOD_TYPE_KEYWORDS = ("洪涝", "洪水", "内涝", "渍涝", "山洪", "凌汛")
 FLOOD_TEXT_KEYWORDS = (
     "洪涝", "山洪", "内涝", "渍涝", "洪水", "漫堤", "决口", "溃坝", "淹没农田", "积水受淹",
@@ -131,7 +131,7 @@ FLOOD_TEXT_KEYWORDS = (
 # --------------------------------------------------------------------------
 # 灾情数据契约
 # --------------------------------------------------------------------------
-# 读取时立即丢弃的个人隐私列（决议 §6.1-2）
+# 读取时立即丢弃的个人隐私列（决议 `docs/experiment_protocol.md` §2-2）
 PRIVACY_COLS = ["tabulator", "contact"]
 
 DISASTER_USECOLS = [
@@ -199,7 +199,7 @@ DISASTER_TYPE_TO_IDX = {t: i for i, t in enumerate(DISASTER_TYPES_14)}
 NUM_DISASTER_TYPES = len(DISASTER_TYPES_14)
 assert NUM_DISASTER_TYPES == 14
 
-# 24 -> 14 确定性映射（决议 §6.3）。None 表示丢弃。
+# 24 -> 14 确定性映射（决议 `docs/data_audit.md` §3.2）。None 表示丢弃。
 DISASTER_TYPE_MAP_24_TO_14 = {
     "暴雨": "暴雨",
     "冰雹": "冰雹",
@@ -281,7 +281,7 @@ REGIONS = {
 }
 
 # --------------------------------------------------------------------------
-# 空间邻接（决议 §6.1-6）
+# 空间邻接（决议 `docs/experiment_protocol.md` §2-6）
 # --------------------------------------------------------------------------
 # 物理近邻候选池：同省 + 陆上邻省。省级邻接为稳定地理事实，非外部数据文件。
 PROVINCE_ADJACENCY = {
@@ -338,7 +338,7 @@ PHYSICAL_NEIGHBOR_K = 6  # 每个节点的物理近邻出边数
 ADV_WEIGHT_PRS = 0.5  # delta_prs_24h 相关系数权重
 ADV_WEIGHT_TEM = 0.5  # TEM_Avg 相关系数权重
 
-# ---- Phase 1.5 决议 §6.9：分层双池空间平流图 ----
+# ---- Phase 1.5 决议（`docs/experiment_protocol.md` §3.5）：分层双池空间平流图 ----
 # 池 1：同地市连通 + 同省物理近邻 Top-K_IN_PROV
 # 池 2：邻省（区域子集内）物理近邻 Top-K_CROSS_PROV
 # 预期跨省边占比 20%~30%（Phase 1 实测仅 3.3%~5.4%）。

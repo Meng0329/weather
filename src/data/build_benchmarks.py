@@ -88,7 +88,7 @@ def _zscore_rows(x: np.ndarray) -> np.ndarray:
 
 
 # ==========================================================================
-# Phase 1.5 §6.7：洪涝多标签共激活
+# Phase 1.5（`docs/experiment_protocol.md` §3.3）：洪涝多标签共激活
 # ==========================================================================
 _FLOOD_TYPE_RE = "|".join(C.FLOOD_TYPE_KEYWORDS)
 _FLOOD_TEXT_RE = "|".join(C.FLOOD_TEXT_KEYWORDS)
@@ -97,7 +97,7 @@ _FLOOD_TEXT_RE = "|".join(C.FLOOD_TEXT_KEYWORDS)
 def add_flood_activation(df: pd.DataFrame) -> pd.DataFrame:
     """为每条记录计算 `label_types`（14 类多标签集合）。
 
-    规则（决议 §6.7）：
+    规则（决议 `docs/experiment_protocol.md` §3.3）：
       1. `disaster_type_14` 的主类必然激活；
       2. 原始 `disaster_type` 命中 洪涝|洪水|内涝|渍涝|山洪|凌汛 -> 额外激活 `洪涝`
          （含 70,158 条 `暴雨洪涝`，使其同时激活 `暴雨` 与 `洪涝`）；
@@ -127,7 +127,7 @@ def add_flood_activation(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_cascade_stats(rec: pd.DataFrame) -> dict:
-    """统计灾害链级联样本（决议 §6.7）。
+    """统计灾害链级联样本（决议 `docs/experiment_protocol.md` §3.3）。
 
     - 暴雨→洪涝：同一区县内，暴雨洪涝事件的持续天数 >= 2 天记 1 个正样本；
     - 暴雨→洪涝→地质灾害：同一区县内洪涝激活后 [t, t+3] 天内出现地质灾害。
@@ -180,7 +180,7 @@ def build_adjacency(
     池 1（同域）：同地市完全连通 + 同省内相关系数 Top-K_IN_PROV
     池 2（跨域）：相邻省份（限区域子集内）相关系数 Top-K_CROSS_PROV
 
-    决议 §6.9：跨省边占比目标 20%~30%（Phase 1 双池前仅 3.3%~5.4%）。
+    决议（`docs/experiment_protocol.md` §3.5）：跨省边占比目标 20%~30%（Phase 1 双池前仅 3.3%~5.4%）。
     """
     n = len(stations)
     prov = stations["Province"].to_numpy()
@@ -367,7 +367,7 @@ def build_region(
     rec = disaster[disaster["province"].isin(provinces)].copy()
     n_before = len(rec)
 
-    # 洪涝共激活（决议 §6.7）：多标签而非互斥单分类
+    # 洪涝共激活（决议 `docs/experiment_protocol.md` §3.3）：多标签而非互斥单分类
     rec = add_flood_activation(rec)
 
     # 展开候选区县

@@ -1,6 +1,6 @@
 """PT-GNO：物理引导的相变图神经算子（唯一主模型，无模块缝合）。
 
-数学结构（与 `CLAUDE.md` §1.2 / §1.4 严格对应）：
+数学结构（与 `CLAUDE.md` §1.2/§1.4 + `docs/design_decisions.md` 严格对应）：
 
     dU_i(t) = -Σ_j K_adv(ΔP_ij, WIN_ij)(U_i - U_j)      # 水平气压-风场平流
               + Ψ_in(X^meteo_i,t)                        # 垂直致灾能量注入
@@ -32,6 +32,24 @@ import torch.nn.functional as F
 NUM_DISASTERS = 14
 NUM_LEVELS = 5
 NUM_CONT = 6
+
+
+class ContMeanMixin:
+    """连续损失读出的**目标先验均值**承载。
+
+    `log10(1+y)` 的均值在 1.5~3.5；若读出从 0 起步，正样本预测会被整体压低一个
+    数量级，条件 R² 长期为负。这里把训练集正样本均值注册成 buffer，
+    所有模型的连续损失头统一用 `softplus(head + cont_pos_mean)` 解码。
+    """
+
+    def init_cont_mean(self) -> None:
+        self.register_buffer("cont_pos_mean", torch.full((NUM_CONT,), 1.5))
+
+    def set_cont_pos_mean(self, v) -> None:
+        with torch.no_grad():
+            self.cont_pos_mean.copy_(
+                torch.as_tensor(v, dtype=self.cont_pos_mean.dtype,
+                                device=self.cont_pos_mean.device).view(-1))
 
 
 # ==========================================================================
@@ -260,25 +278,30 @@ class LandauPhaseTransitionReadout(nn.Module):
     """
 
     def __init__(self, d_model: int, eps: float = 0.2, hidden: int = 128,
-                 use_phase_gate: bool = True, dropout: float = 0.1):
+                 use_phase_gate: bool = True, dropout: float = 0.1,
+                 gate_zero_threshold: float = 0.5):
         super().__init__()
         self.use_phase_gate = use_phase_gate
+        self.gate_zero_threshold = gate_zero_threshold
         self.eps_raw = nn.Parameter(torch.tensor(float(eps)))
         self.type_proj = nn.Linear(d_model, NUM_DISASTERS)      # U -> 14 维灾种潜空间
         self.w_base = nn.Parameter(torch.zeros(NUM_DISASTERS, NUM_DISASTERS))
         self.b_topo = nn.Parameter(torch.zeros(NUM_DISASTERS))
         self.topo_head = nn.Sequential(nn.Linear(d_model, hidden), nn.GELU(),
                                        nn.Linear(hidden, NUM_DISASTERS))
-        self.level_head = nn.Sequential(nn.Linear(d_model + 1, hidden), nn.GELU(),
-                                        nn.Linear(hidden, NUM_LEVELS))
-        self.cont_head = nn.Sequential(nn.Linear(d_model + 1, hidden), nn.GELU(),
-                                       nn.Linear(hidden, NUM_CONT))
+        # 输入 = [U, gate, 14 类激活概率]：损失量级高度依赖灾种，
+        # 不把灾种信息送进损失头会让回归只能预测全局均值（R²≈0）。
+        self.level_head = nn.Sequential(nn.Linear(d_model + 1 + NUM_DISASTERS, hidden),
+                                        nn.GELU(), nn.Linear(hidden, NUM_LEVELS))
+        self.cont_head = nn.Sequential(nn.Linear(d_model + 1 + NUM_DISASTERS, hidden),
+                                       nn.GELU(), nn.Linear(hidden, NUM_CONT))
         # 连续损失在 log10(1+y) 空间取值 ~0.5~4；ReLU 读出若从 0 起步会长时间
         # 学不到尺度（R² 起初极端为负）。把末层偏置初始化到该先验均值附近。
         nn.init.constant_(self.cont_head[-1].bias, 1.5)
         with torch.no_grad():
             self.cont_head[-1].weight.mul_(0.1)
         self.drop = nn.Dropout(dropout)
+        self.register_buffer("cont_pos_mean", torch.full((NUM_CONT,), 1.5))
 
     def phase_gate(self, U: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
         """朗道门控：σ((RMS(U) - τ)/ε)。
@@ -302,11 +325,27 @@ class LandauPhaseTransitionReadout(nn.Module):
         logits = torch.einsum("bnij,bnj->bni", cascade, z) \
             + self.topo_head(U_d) + self.b_topo
         topo_prob = gate.unsqueeze(-1) * torch.sigmoid(logits)
-        feat = torch.cat([U_d, gate.unsqueeze(-1)], dim=-1)
+        feat = torch.cat([U_d, gate.unsqueeze(-1), topo_prob], dim=-1)
         level_logits = self.level_head(feat)
-        cont = F.relu(self.cont_head(feat)) * gate.unsqueeze(-1)
+
+        # 条件连续损失：**不受亚临界衰减**，直接回归正样本的 log10(1+y)。
+        # 用 softplus + 训练集正样本均值作为先验中心，保证初始化即有正确量级。
+        cont_cond = F.softplus(self.cont_head(feat) + self.cont_pos_mean)
+
+        # Straight-Through：前向值 = cont_cond（不缩小），但梯度仍能沿 gate 回传，
+        # 使"损失强度"参与相变门控的学习。
+        g = gate.unsqueeze(-1)
+        cont_st = cont_cond * (g - g.detach() + 1.0)
+
+        # 无条件/全网格推断：亚临界节点（gate < 阈值）的损失读出置零（图谱静默）。
+        cont_full = cont_cond * (gate.unsqueeze(-1) >= self.gate_zero_threshold)
         return {"topo_prob": topo_prob, "topo_logits": logits,
-                "level_logits": level_logits, "cont": cont,
+                "phase_gate": gate, "phase_logit": torch.logit(
+                    gate.clamp(1e-6, 1 - 1e-6)),
+                "level_logits": level_logits,
+                "cont": cont_st,          # 训练/条件评估用（未受门控压缩）
+                "cont_cond": cont_cond,   # 纯条件回归头
+                "cont_full": cont_full,   # 全网格推断用（亚临界置零）
                 "phase_gate": gate, "U": U}
 
 
@@ -367,6 +406,13 @@ class PT_GNO(nn.Module):
             nn.Linear(c.hidden, c.d_model),
         )
 
+    def set_cont_pos_mean(self, v) -> None:
+        """把训练集正样本的 log10 均值注入连续损失读出（Phase 2.5）。"""
+        with torch.no_grad():
+            self.readout.cont_pos_mean.copy_(
+                torch.as_tensor(v, dtype=self.readout.cont_pos_mean.dtype,
+                                device=self.readout.cont_pos_mean.device).view(-1))
+
     # ------------------------------------------------------------------
     def convective_params(self, batch) -> dict:
         """逐 (节点, 时刻) 推断本构参数 Θ=(τ, γ, W_cascade)。
@@ -397,14 +443,23 @@ class PT_GNO(nn.Module):
             if assim_mask is not None:
                 obs = assim_mask[:, t]                              # (B,N)
                 if bool((obs > 0).any()):
-                    h_post = batch["h_post"][:, t]
+                    # Task 3 可逐时刻给出报告文本；否则用窗口锚点的文本
+                    if "assim_text" in batch:
+                        h_post = batch["assim_text"][:, t]
+                    elif "assim_idx" in batch and "assim_table" in batch:
+                        # 惰性 gather：只为当前时刻构造 (B,N,D)，避免 (B,T,N,D) 的
+                        # 271 MB/批 中转（North_Agro, B=32, N=589, D=512）
+                        h_post = batch["assim_table"][batch["assim_idx"][:, t].clamp_min(0)]
+                    else:
+                        h_post = batch["h_post"]
                     jump = self.assim(torch.cat([U, h_post], dim=-1))
                     assim_delta = jump * obs.unsqueeze(-1)
             U = self.cell(U, x[:, t], adv[:, t], edge_index, edge_w,
-                          theta["gamma"][:, t], assim_delta=assim_delta)
-        r = self.readout(U, theta["tau"][:, -1], theta["delta_w"][:, -1])
+                          theta["gamma"], assim_delta=assim_delta)
+        r = self.readout(U, theta["tau"], theta["delta_w"])
         r["kl"] = theta["kl"].mean()
-        r["tau"] = theta["tau"][:, -1]
+        r["tau"] = theta["tau"]
+        r["gamma"] = theta["gamma"]
         return r
 
 

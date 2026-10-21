@@ -30,7 +30,7 @@ def test_feature_order_matches_documented_contract():
 
 def test_dropped_meteo_cols_are_not_features():
     # Lit/Thund/Tord 从未进入特征契约；WIN_S_10mi_Avg 只保留在 16 维原始落盘契约中，
-    # 建模用的 15 维契约必须已剔除它（Phase 1.5 §6.6）
+    # 建模用的 15 维契约必须已剔除它（Phase 1.5 `docs/experiment_protocol.md` §3.2）
     for col in ("Lit", "Thund", "Tord"):
         assert col not in C.FEATURE_NAMES
         assert col not in C.FEATURE_NAMES_15

@@ -92,7 +92,7 @@ def load_disaster_parts(raw_dir: Path) -> pd.DataFrame:
             usecols=C.DISASTER_USECOLS,
             low_memory=False,
         )
-        # 决议 §6.1-2：隐私列已在 usecols 层面排除，这里再断言一次
+        # 决议（`docs/experiment_protocol.md` §2-2）：隐私列已在 usecols 层面排除，这里再断言一次
         leaked = set(C.PRIVACY_COLS) & set(df.columns)
         assert not leaked, f"{f.name} 泄漏隐私列: {leaked}"
         frames.append(df)
@@ -104,7 +104,7 @@ def load_disaster_parts(raw_dir: Path) -> pd.DataFrame:
 
 
 def fix_economic_loss(df: pd.DataFrame) -> dict:
-    """决议 §6.1-3：>= 1e8 万元 -> ÷ 1e4。"""
+    """决议（`docs/experiment_protocol.md` §2-3）：>= 1e8 万元 -> ÷ 1e4。"""
     before = df["economic_loss"].copy()
     mask = before >= C.ECONOMIC_LOSS_FIX_THRESHOLD
     df.loc[mask, "economic_loss"] = before[mask] / C.ECONOMIC_LOSS_FIX_DIVISOR
@@ -119,7 +119,7 @@ def fix_economic_loss(df: pd.DataFrame) -> dict:
 
 
 def map_disaster_types(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """决议 §6.3：24 -> 14 确定性映射，并输出完整明细表。"""
+    """决议（`docs/data_audit.md` §3.2）：24 -> 14 确定性映射，并输出完整明细表。"""
     raw_counts = df["disaster_type_std"].value_counts(dropna=False)
     df = df.copy()
     df["disaster_type_14"] = df["disaster_type_std"].map(C.DISASTER_TYPE_MAP_24_TO_14)

@@ -35,9 +35,10 @@ def _fake_batch(B=2, text_dim=D):
     return {
         "x": x, "mask": mask, "adv": adv,
         "edge_index": edge_index, "edge_w": edge_w,
-        "h_cur": torch.randn(B, T, N, text_dim),
-        "h_rag": torch.randn(B, T, N, text_dim),
-        "h_post": torch.randn(B, T, N, text_dim),
+        # 文本按 (B,N,D)：本构泛函对每个节点推断一次 Θ，不随窗口时间步重复
+        "h_cur": torch.randn(B, N, text_dim),
+        "h_rag": torch.randn(B, N, text_dim),
+        "h_post": torch.randn(B, N, text_dim),
         "assim_mask": torch.zeros(B, T, N),
     }
 
@@ -92,13 +93,26 @@ def test_phase_gate_in_unit_interval_and_monotone():
 
 
 def test_cont_prediction_is_gated_by_phase():
-    """亚临界时连续损失读出必须被门控压到 0。"""
+    """亚临界时**全网格推断**的连续损失必须置零；条件回归头不受门控压缩。
+
+    Phase 2.5：`cont`（条件回归，供损失与条件指标）保持量级，
+    `cont_full`（无条件推断）在 gate < 阈值时置零。
+    """
     ro = LandauPhaseTransitionReadout(d_model=8)
     U = torch.zeros(1, 1, 8)
     tau = torch.full((1, 1), 1e6)          # 阈值极高 -> 亚临界
     out = ro(U, tau, torch.zeros(1, 1, 14, 14))
-    assert float(out["cont"].abs().max()) < 1e-6
+    assert float(out["cont_full"].abs().max()) < 1e-6, "亚临界全网格推断必须静默"
     assert float(out["topo_prob"].abs().max()) < 1e-6
+    assert float(out["cont_cond"].min()) > 0.0, "条件回归头不应被门控压成 0"
+
+
+def test_cont_cond_is_centered_on_prior_mean():
+    """正样本条件回归的初值应落在 log10 目标量级，而不是 0 附近。"""
+    ro = LandauPhaseTransitionReadout(d_model=8)
+    ro.cont_pos_mean.copy_(torch.full((6,), 2.0))
+    out = ro(torch.randn(2, 5, 8), torch.zeros(2, 5), torch.zeros(2, 5, 14, 14))
+    assert float(out["cont_cond"].mean()) > 1.5
 
 
 def test_advection_kernel_depends_on_physical_inputs():

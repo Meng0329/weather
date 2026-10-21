@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import os
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -64,7 +65,10 @@ class RegionBundle:
 
     def contiguous(self) -> "RegionBundle":
         """把 memmap 读入内存，加速训练（仅区域子集，规模可控）。"""
-        self.feats = np.ascontiguousarray(self.feats)
+        # 只把高频访问的三张表读进内存；`feats` 只用于平流核的 3 个物理通道，
+        # 保留 memmap 让 OS page cache 在多进程间共享，避免每个 run 复制 227 MB。
+        if isinstance(self.feats_n, np.memmap):
+            self.feats_n = np.asarray(self.feats_n)
         self.mask = np.ascontiguousarray(self.mask)
         self.labels = np.ascontiguousarray(self.labels)
         return self
@@ -142,8 +146,13 @@ def _build_day_targets(records: pd.DataFrame, n_nodes: int, n_days: int,
     return level, cont, np.asarray(C.CONTINUOUS_LOSS_TARGETS)
 
 
-def compute_norm_stats(bundle: RegionBundle, split: str = "train") -> tuple[np.ndarray, np.ndarray]:
-    """逐通道标准化统计量，**只用训练期**数据计算（杜绝泄漏）。"""
+def compute_norm_stats(bundle: RegionBundle, split: str = "train",
+                        day_stride: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """逐通道标准化统计量，**只用训练期**数据计算（杜绝泄漏）。
+
+    按 `day_stride` 抽样日期以控制开销：训练期近 7000 天，抽样 1/3 已足够
+    稳定地估计逐通道均值/方差（相对误差 < 1%）。
+    """
     y0, y1 = C.SPLITS[split]
     years = bundle.dates.year
     lo = int(np.nonzero(years >= y0)[0][0])
@@ -153,15 +162,31 @@ def compute_norm_stats(bundle: RegionBundle, split: str = "train") -> tuple[np.n
     s2 = np.zeros(n_ch, dtype=np.float64)
     cnt = np.zeros(n_ch, dtype=np.float64)
     for a in range(0, bundle.n_nodes, 64):                 # 分块，避免整表读入
-        blk = np.asarray(bundle.feats[a:a + 64, lo:hi + 1], dtype=np.float64)
-        msk = np.asarray(bundle.mask[a:a + 64, lo:hi + 1], dtype=np.float64)
-        s += (blk * msk).sum(axis=(0, 1))
-        s2 += (blk * blk * msk).sum(axis=(0, 1))
-        cnt += msk.sum(axis=(0, 1))
+        blk = np.asarray(bundle.feats[a:a + 64, lo:hi + 1:day_stride], dtype=np.float32)
+        msk = np.asarray(bundle.mask[a:a + 64, lo:hi + 1:day_stride], dtype=np.float32)
+        blk = blk * msk
+        s += blk.sum(axis=(0, 1), dtype=np.float64)
+        s2 += (blk * blk).sum(axis=(0, 1), dtype=np.float64)
+        cnt += msk.sum(axis=(0, 1), dtype=np.float64)
     cnt = np.maximum(cnt, 1.0)
     mean = s / cnt
     var = np.maximum(s2 / cnt - mean ** 2, 1e-6)
     return mean.astype(np.float32), np.sqrt(var).astype(np.float32)
+
+
+def build_feats_n(bundle: RegionBundle, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """流式生成标准化后的气象张量（分块写，避免 float64 全表拷贝）。"""
+    n, t, f = bundle.feats.shape
+    out = np.empty((n, t, f), dtype=np.float32)
+    m = mean.astype(np.float32)
+    s = std.astype(np.float32)
+    for a in range(0, n, 64):
+        blk = np.asarray(bundle.feats[a:a + 64], dtype=np.float32)
+        msk = np.asarray(bundle.mask[a:a + 64], dtype=np.float32)
+        z = (blk - m) / s
+        z *= msk
+        out[a:a + 64] = z
+    return out
 
 
 def load_region(region: str, processed: Path | None = None,
@@ -190,11 +215,35 @@ def load_region(region: str, processed: Path | None = None,
     b.day_loss_level = level
     b.day_cont = cont
     b.norm_mean, b.norm_std = compute_norm_stats(b)
+    # 标准化张量落盘缓存：每次 run 重算要 ~40 s，150 个 run 就是 1.7 小时
+    cache = root / "meteo_features_n.npy"
+    stats_json = root / "feature_norm_stats.json"
+    import json as _json
+
+    def _atomic_save(arr, path):
+        # 多个 run 并行时可能同时写缓存：先写临时文件再 rename，避免读到半截张量
+        tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+        np.save(tmp, arr)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+
+    if cache.exists() and stats_json.exists():
+        st = _json.loads(stats_json.read_text("utf-8"))
+        if np.allclose(st["mean"], b.norm_mean, atol=1e-3):
+            b.feats_n = np.load(cache, mmap_mode="r")
+        else:
+            b.feats_n = build_feats_n(b, b.norm_mean, b.norm_std)
+            _atomic_save(b.feats_n, cache)
+    else:
+        b.feats_n = build_feats_n(b, b.norm_mean, b.norm_std)
+        _atomic_save(b.feats_n, cache)
+        stats_json.write_text(_json.dumps(
+            {"mean": b.norm_mean.tolist(), "std": b.norm_std.tolist()},
+            ensure_ascii=False), encoding="utf-8")
     if contiguous:
         b.contiguous()
-    # 标准化后的副本（平流核物理量保持原量纲，不归一化）
-    b.feats_n = ((np.asarray(b.feats) - b.norm_mean) / b.norm_std).astype(np.float32)
-    b.feats_n = np.where(np.asarray(b.mask) > 0, b.feats_n, 0.0).astype(np.float32)
     return b
 
 
@@ -227,8 +276,15 @@ class WindowDataset(Dataset):
         return int(self.days[k])
 
 
-def build_sample(bundle: RegionBundle, day: int, tin: int, delta: int) -> dict:
-    """构造单个整窗样本（numpy / torch 混合，collate 只做 stack）。"""
+def build_sample(bundle: RegionBundle, day: int, tin: int, delta: int,
+                 assim_p: float = 0.0, rng: np.random.Generator | None = None) -> dict:
+    """构造单个整窗样本（numpy / torch 混合，collate 只做 stack）。
+
+    `assim_p>0` 时以该概率为本窗口**注入观测报告**（Task 3 同化门的训练信号）：
+    对每个节点取窗口内最后一天有灾后文本的位置作为"报告到达时刻"。
+    训练期必须这样做，否则 `G_assim` 永远乘 0 掩码、拿不到梯度，
+    推理阶段就是一个随机扰动（实测 Task 3 增益 ≈ 0）。
+    """
     t0 = day - tin + 1
     src = bundle.feats_n if bundle.feats_n is not None else bundle.feats
     x = np.asarray(src[:, t0:day + 1], dtype=np.float32)             # (N,T,F)
@@ -243,30 +299,37 @@ def build_sample(bundle: RegionBundle, day: int, tin: int, delta: int) -> dict:
     cont = bundle.day_cont[:, tw, :].sum(axis=1)                         # (N,6)
     cont = np.log10(1.0 + cont.astype(np.float64)).astype(np.float32)
 
-    # 文本：当日有文本则用当日，否则在输入窗口内向前回填
+    # 文本：只返回**索引**（(N,) int64），向量在 collate 里一次性 index_select。
+    # 逐窗口构造 (N,512) 文本张量会产生 ~1 GB/epoch 的无谓内存搬运，是数据管线瓶颈。
     ti = bundle.text_index[:, t0:day + 1]                                # (N,T)
     idx = np.full(bundle.n_nodes, -1, dtype=np.int64)
     for k in range(tin - 1, -1, -1):
         unset = idx < 0
         idx[unset] = ti[unset, k]
     has_text = idx >= 0
-    N, T, F = x.shape
-    D = bundle.text_dim
-    h_pre = torch.zeros(N, D)
-    h_rag = torch.zeros(N, D)
-    h_post = torch.zeros(N, D)
-    if has_text.any():
-        sel = torch.from_numpy(idx[has_text])
-        h_pre[torch.from_numpy(np.nonzero(has_text)[0])] = bundle.text_pre[sel]
-        h_rag[torch.from_numpy(np.nonzero(has_text)[0])] = bundle.text_rag[sel]
-        h_post[torch.from_numpy(np.nonzero(has_text)[0])] = bundle.text_post[sel]
+
+    # 同化掩码：窗口末日的"灾后报告"到达位置（每个节点各自最多一个跳变）
+    assim_mask = np.zeros((tin, bundle.n_nodes), dtype=np.float32)
+    assim_idx = np.full((tin, bundle.n_nodes), -1, dtype=np.int64)
+    if assim_p > 0.0 and (rng is None or rng.random() < assim_p):
+        last = np.full(bundle.n_nodes, -1, dtype=np.int64)
+        for k in range(tin - 1, -1, -1):                 # 从后往前，取最近一天有文本
+            take = (last < 0) & (ti[:, k] >= 0)
+            last[take] = k
+        for k in range(tin):
+            sel = last == k
+            if sel.any():
+                assim_mask[k, sel] = 1.0
+                assim_idx[k, sel] = ti[sel, k]
 
     return {
         "day": day,
         "x": torch.from_numpy(x), "mask": torch.from_numpy(m),
         "adv": torch.from_numpy(np.ascontiguousarray(adv)),
-        "h_pre": h_pre, "h_rag": h_rag, "h_post": h_post,
+        "text_idx": torch.from_numpy(idx),
         "has_text": torch.from_numpy(has_text.astype(np.float32)),
+        "assim_mask": torch.from_numpy(assim_mask),
+        "assim_idx": torch.from_numpy(assim_idx),
         "topo": torch.from_numpy(topo),
         "level": torch.from_numpy(np.where(lv >= 0, lv, 0).astype(np.int64)),
         "level_mask": torch.from_numpy((lv >= 0).astype(np.float32)),
@@ -282,27 +345,43 @@ def collate(samples: list[dict], bundle: RegionBundle, device="cpu") -> dict:
 
     B = len(samples)
     T = samples[0]["x"].shape[1]
+    # 文本向量：把 (B,N) 索引一次性 gather 成 (B,N,D)（拼一个零行处理“无文本”）
+    tidx = stack("text_idx")
+    zero = torch.zeros(1, bundle.text_dim)
+    def _gather(table):
+        return torch.cat([table, zero], dim=0)[
+            torch.where(tidx >= 0, tidx, torch.full_like(tidx, table.shape[0]))]
+
     batch = {
         # build_sample 产出 (N,T,F)，堆叠后需转为模型约定的 (B,T,N,F)
         "x": stack("x").permute(0, 2, 1, 3).contiguous(),
         "mask": stack("mask").permute(0, 2, 1, 3).contiguous(),
         "adv": stack("adv").permute(0, 2, 1, 3).contiguous(),
         "topo": stack("topo"), "level": stack("level"),
+        # 相位目标：该节点-日在预测窗口内是否发生**任意**灾种（P(相变) 的监督信号）
+        "phase_target": stack("topo").max(dim=-1).values,
         "level_mask": stack("level_mask"), "cont": stack("cont"),
         "cont_mask": stack("cont_mask"),
-        "h_pre": stack("h_pre"), "h_rag": stack("h_rag"), "h_post": stack("h_post"),
+        "h_pre": _gather(bundle.text_pre),
+        "h_rag": _gather(bundle.text_rag),
+        "h_post": _gather(bundle.text_post),
         "has_text": stack("has_text"),
         "days": torch.tensor([s["day"] for s in samples], dtype=torch.long),
         "edge_index": bundle.edge_index, "edge_w": bundle.edge_w,
-        "assim_mask": torch.zeros(B, T, bundle.n_nodes),
+        # 同化掩码 (B,T,N)；训练期由 build_sample(assim_p>0) 随机注入，
+        # 评估期恒为 0（Task 1/2 不得看到灾后文本，否则是标签泄露）。
+        # 注意 build_sample 产出的是 (T,N)，stack 后已是 (B,T,N)，无需再转置。
+        "assim_mask": stack("assim_mask"),
     }
-    # 模型侧统一使用 h_cur（= 灾前可见文本，weather_summary/warning_info/remarks），
-    # h_rag 作为 KL 先验条件，h_post 仅在 Task 3 观测到达时刻由 assim_mask 注入。
-    # 三者按 (B,T,N,D) 广播，供算子逐时刻读取。
-    Tb, Nb, Db = T, bundle.n_nodes, batch["h_pre"].shape[-1]
-    batch["h_cur"] = batch["h_pre"].unsqueeze(1).expand(B, Tb, Nb, Db).contiguous()
-    batch["h_rag"] = batch["h_rag"].unsqueeze(1).expand(B, Tb, Nb, Db).contiguous()
-    batch["h_post"] = batch["h_post"].unsqueeze(1).expand(B, Tb, Nb, Db).contiguous()
+    aidx = stack("assim_idx")                                    # (B,T,N)
+    if bool((aidx >= 0).any()):
+        # 只传索引 + 文本表：按 (B,T,N,D) 展开在 North_Agro(B=32,N=589) 上是
+        # 32*7*589*512*4 ≈ 271 MB/批，模型在真正需要的那一步再 gather。
+        batch["assim_idx"] = aidx
+        batch["assim_table"] = bundle.text_post
+    # 文本不按时间维展开：本构泛函对 (B,N,D) 只推断一次 Θ，
+    # 再在算子循环里广播使用。展开成 (B,T,N,D) 会凭空制造 ~0.5 GB/批的搬运。
+    batch["h_cur"] = batch.pop("h_pre")
     return to_device(batch, device)
 
 

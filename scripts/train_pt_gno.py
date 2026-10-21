@@ -25,6 +25,17 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import os  # noqa: E402
+
+# 多进程并行时 BLAS 线程会严重超订（每 epoch 从 6 s 退化到 30 s），
+# 必须在导入 numpy/torch 之前把线程数钉死。
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+import torch                              # noqa: E402
+torch.set_num_threads(1)
+
 from src.data import common as C          # noqa: E402
 from src.engine.data import load_region   # noqa: E402
 from src.engine.trainer import LossConfig, TrainConfig, train  # noqa: E402
@@ -53,10 +64,13 @@ def run_one(kind: str, name: str | None, args, text_dim: int) -> dict:
         weight_decay=args.weight_decay, batch_size=args.batch_size,
         tin=args.tin, delta=args.delta, stride=args.stride, seed=args.seed,
         device=args.device, out_dir=args.out_dir, log_every=args.log_every,
+        patience=args.patience, amp=not args.no_amp, val_stride=args.val_stride,
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
     )
-    loss_cfg = LossConfig(beta_max=args.beta, beta_warmup=args.beta_warmup)
+    loss_cfg = LossConfig(beta_max=args.beta, beta_warmup=args.beta_warmup,
+                          w_phase=args.w_phase, w_level=args.w_level,
+                          w_cont=args.w_cont)
     label = name or "PT_GNO"
     print(f"\n=== [{kind}] {label} @ {args.region} ===", flush=True)
     res = train(builder, tcfg, loss_cfg)
@@ -72,21 +86,27 @@ def main(argv=None) -> int:
     ap.add_argument("--baseline", default=None, choices=list(BASELINE_REGISTRY))
     ap.add_argument("--suite", action="store_true",
                     help="依次跑主模型 + 4 个消融 + 全部基线")
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--tin", type=int, default=7)
     ap.add_argument("--delta", type=int, default=1)
-    ap.add_argument("--stride", type=int, default=3)
+    ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument("--beta-warmup", type=int, default=10)
+    ap.add_argument("--w-phase", type=float, default=0.5)
+    ap.add_argument("--w-level", type=float, default=0.5)
+    ap.add_argument("--w-cont", type=float, default=1.0)
     ap.add_argument("--max-train-samples", type=int, default=None)
     ap.add_argument("--max-val-samples", type=int, default=None)
     ap.add_argument("--log-every", type=int, default=20)
+    ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--val-stride", type=int, default=8)
     ap.add_argument("--out-dir", default="outputs/runs")
     ap.add_argument("--report", default="outputs/runs/summary.json")
     args = ap.parse_args(argv)

@@ -1,6 +1,6 @@
 """PT-GNO 的 4 个受控消融变体（只切换数学式中的一项，其余完全共享）。
 
-与 `CLAUDE.md` §6.5 一一对应：
+与 `docs/experiment_protocol.md` §3.1 一一对应：
 
 1. `w/o Phase-Transition Gate`      → 门控恒为 1（`phase_gate` 不再依赖 ||U||-τ）
 2. `w/o Advection PDE`              → 平流核退化为自由注意力（丢失气压-风场物理结构）
