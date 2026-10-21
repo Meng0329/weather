@@ -130,3 +130,33 @@
 - **密钥与地址只从环境变量或 `~/.config/ptgno/env` 读取，禁止写入仓库**。
 
 ---
+
+## Phase 3：全量实验套件（2026-10-21）
+
+### 规模
+
+150 runs = 3 区域 × (PT-GNO + 4 消融 + 5 基线) × 5 seeds，全部完成、0 失败。
+统一 20 epochs / patience 8 / T_in 7 / Δ=1 / batch 32 / AMP；
+逐类阈值在验证集校准，模型选择按验证集活跃域 Macro-F1。
+
+### 过程中暴露并修复的 7 个缺陷
+
+1. `run_suite.py` 在 skip 分支取 `r['gpu']` 触发 KeyError，整轮 150 run 被拖死。
+2. 并行 seed 共用同一 `best.pt`，测试阶段从磁盘重载 → 互相评估到别人的权重。
+3. 五个基线在 AMP 下 `scatter_add_` dtype 不匹配（fp32 权重 vs fp16 激活）→ 全部崩溃。
+4. GraphWaveNet 固定 `node_emb=400`，North-Agro(589) 截断崩溃（SW 398/SE 353 恰好掩盖）。
+5. 基线未返回 `topo_logits` → `free_energy_loss` KeyError。
+6. 规范化张量缓存并发写非原子 → 改为临时文件 + `os.replace`。
+7. 多步评测未读 checkpoint 阈值（F1 恒 0）、checkpoint 目录名用类名（跳过缝合基线）。
+
+### 关键实测
+
+- Task 1（测试集，活跃域 F1ₐ）：Stitched-GNN-LLM 0.230/0.253/0.199 三区域领先；
+  PT-GNO 0.194/0.206/0.192；Hits@3 上 PT-GNO 在 SW 0.893、SE 0.854 反超。
+- 消融：`w/o LLM Constitutive Functional` F1ₐ 塌到 0.03（p<0.001）；
+  `w/o Phase-Transition Gate` 与主模型无差异（p=0.804）。
+- Task 3：SW −5.8%/−9.9%、SE −6.5%/−19.2%、NA +2.3%/+2.6%（同化方向不一致）。
+- 45-epoch 收敛诊断（SW, seed42）：PT-GNO 0.210 vs Stitched 0.237，差距非预算所致。
+- 门控诊断：条件概率 σ(logits) 相比联合概率 F1ₐ 0.202→0.209、AUPRCₐ 0.197→0.225。
+
+结论与局限详见 `docs/paper/experimental_results.md` 末节。
