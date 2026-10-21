@@ -24,7 +24,7 @@ from src.data import common as C          # noqa: E402
 from src.models.ablations import ABLATION_NAMES  # noqa: E402
 from src.models.baselines import BASELINE_REGISTRY  # noqa: E402
 
-MAIN_NAME = "PT-GNO"
+MAIN_NAME = "PT_GNO"   # 与 run_suite 的目录名一致（否则显著性表为空）
 
 TASK1_KEYS = ["macro_f1", "macro_f1_active", "auprc_active", "mrr_active",
               "hits@3_active", "micro_f1"]

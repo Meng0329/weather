@@ -57,19 +57,25 @@ def main(argv=None) -> int:
     for name in args.models:
         kind = "main" if name == "PT_GNO" else name
         safe = name.replace("/", "_")
-        ck = (Path(args.ckpt_root) / args.region / safe / "_ckpt"
-              / f"{args.region}_{name}" / f"s{args.seed}" / "best.pt")
-        if not ck.exists():                        # 兼容不带 seed 子目录的旧布局
-            alt = (Path(args.ckpt_root) / args.region / safe / "_ckpt"
-                   / f"{args.region}_{name}" / "best.pt")
-            ck = alt if alt.exists() else ck
-        if not ck.exists():
-            print(f"跳过 {name}：{ck} 不存在")
+        base = Path(args.ckpt_root) / args.region / safe / "_ckpt"
+        # 目录名用模型的 label（主模型=PT_GNO，基线=类名，如 SW_Cascade_StitchedGNNLLM），
+        # 直接用注册名会找不到。
+        cands = []
+        if base.exists():
+            cands += [p / f"s{args.seed}" / "best.pt" for p in base.iterdir() if p.is_dir()]
+            cands += [p / "best.pt" for p in base.iterdir() if p.is_dir()]
+        ck = next((c for c in cands if c.exists()), None)
+        if ck is None:
+            print(f"跳过 {name}：{base} 下无 best.pt")
             continue
         model = make(kind, bundle.text_dim)
-        model.load_state_dict(torch.load(ck, map_location=args.device,
-                                         weights_only=False)["model"])
+        state = torch.load(ck, map_location=args.device, weights_only=False)
+        model.load_state_dict(state["model"])
         model.to(args.device).eval()
+        # 阈值必须来自 checkpoint：Task 1 的 F1 是逐类校准阈值算的，
+        # 用默认 0.5 会让长尾类全部判负（实测 F1act 恒为 0.000）。
+        th = state.get("thresholds")
+        th = None if th is None else np.asarray(th, dtype=np.float32)
         pw = _topo_pos_weight(bundle).to(args.device)
         cw = _class_weight(bundle).to(args.device)
 
@@ -80,7 +86,7 @@ def main(argv=None) -> int:
             with torch.no_grad():
                 _, pred = _collect(model, ds, bundle, tcfg, args.device, False, 0,
                                    pw, cw, LossConfig())
-            m = evaluate_preds(pred)
+            m = evaluate_preds(pred, thresholds=th)
             m.pop("prob", None)
             row = {"region": args.region, "model": name, "delta": delta,
                    "macro_f1_active": m["macro_f1_active"],

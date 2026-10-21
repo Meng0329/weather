@@ -105,13 +105,16 @@ def export(model, bundle, node: int, event_day: pd.Timestamp, window: int = 10,
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", default="SW_Cascade")
-    ap.add_argument("--ckpt", default="outputs/suite/SW_Cascade/PT_GNO/_ckpt/"
-                                     "SW_Cascade_PT_GNO/s42/best.pt")
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="docs/paper/case_study_phase_portrait.json")
     ap.add_argument("--window", type=int, default=10)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args(argv)
 
+    if args.ckpt is None:
+        args.ckpt = str(Path("outputs/suite") / args.region / "PT_GNO" / "_ckpt"
+                        / f"{args.region}_PT_GNO" / f"s{args.seed}" / "best.pt")
     bundle = load_region(args.region)
     node, day = pick_case(bundle, bundle.records)
     if node is None:
